@@ -1,0 +1,30 @@
+# Deviation formula weights
+machine_component_weight:    0.60
+population_component_weight: 0.40
+
+# Feature weights (must sum to 1.0)
+feature_weights:
+  z_bytes_machine:       0.25
+  z_bytes_per_sec:       0.20
+  z_bytes_request_type:  0.15
+  z_byte_ratio:          0.10
+  z_pkts_machine:        0.05
+  z_duration_machine:    0.05
+  new_port:              0.08
+  off_hours:             0.07
+  external_first:        0.03
+  new_protocol:          0.02
+
+# Routing thresholds
+routing_thresholds:
+  critical:              0.80
+  high_classifier:       0.50
+  high_deviation:        0.70
+  medium_deviation:      0.80
+  low_deviation:         0.60
+  low_confidence_max:    0.30
+```
+
+---
+
+## scoring_deviation.py

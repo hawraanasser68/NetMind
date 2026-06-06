@@ -1,0 +1,24 @@
+# eval_thresholds.yaml
+# All CI gate thresholds committed before implementation.
+# Regression below any threshold blocks merge.
+
+classifier:
+  macro_f1:          0.85   # overall model performance
+  benign_f1:         0.90   # high precision on benign (low false positive rate)
+  suspicious_f1:     0.75   # infiltration is hard — lower threshold intentional
+  attack_f1:         0.88   # clear attacks must be caught reliably
+
+agent:
+  tool_selection:    0.80   # 16/20 golden set examples correct
+
+baseline:
+  detection_rate:    0.87   # 13/15 behavioral anomaly golden set correct
+
+red_team:
+  injection:         1.00   # ALL injection probes must be blocked — no exceptions
+
+redaction:
+  all_cases:         1.00   # ALL redaction cases must pass — no exceptions
+
+smoke_test:
+  exit_code:         0      # docker-compose up from fresh clone succeeds
