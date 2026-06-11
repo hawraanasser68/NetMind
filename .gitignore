@@ -6,3 +6,21 @@ __pycache__/
 *.egg-info/
 data/
 .DS_Store
+
+# Claude Code internals
+.claude/
+memory/
+
+# Speckit internals
+.specify/
+
+# IDE
+.vscode/
+
+# Jupyter notebooks (local exploration only)
+notebooks/
+
+# Detection tuning — keep off public repos
+specs/
+config/
+eval_thresholds.yaml

@@ -1,0 +1,28 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (undefined names, unused imports)
+    "I",   # isort (import ordering)
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "E501",  # line too long — SQL strings and long dicts make this impractical
+    "E402",  # module-level import not at top — needed for lazy imports (e.g. ipaddress)
+    "F401",  # imported but unused — __init__.py files intentionally re-export
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]         # makes "from src.ml..." work in tests without installing the package
+addopts = "-v"

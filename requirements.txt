@@ -1,0 +1,43 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# ML pipeline
+scikit-learn==1.5.2
+lightgbm==4.5.0
+joblib==1.4.2
+numpy==1.26.4
+pandas==2.2.3
+
+# Database
+psycopg2-binary==2.9.9
+pgvector==0.3.2
+alembic==1.13.3
+
+# Redis
+redis==5.1.0
+
+# Secrets
+hvac==2.3.0
+
+# Logging
+structlog==24.4.0
+
+# LLM agent
+anthropic==0.40.0
+
+# Embeddings (pgvector RAG)
+sentence-transformers==3.2.1
+
+# Dashboard
+streamlit==1.39.0
+
+# OSINT
+requests==2.32.3
+python-whois==0.9.4
+
+# Config
+pyyaml==6.0.2
+
+# Tests
+pytest==8.3.3

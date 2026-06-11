@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+# Copy uv binary from the official uv image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN uv pip install --system --no-cache -r requirements.txt
+
+# Only what the migration runner needs
+COPY migrations/ ./migrations/
+COPY alembic.ini .
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+CMD ["alembic", "upgrade", "head"]

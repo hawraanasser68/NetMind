@@ -1,0 +1,134 @@
+version: '3.9'
+
+# ── Base services (Phase 2) ───────────────────────────────────────────────────
+# Bring up with: docker compose up postgres redis vault vault-init migrate
+# App services (classifier, workers, agent, dashboard) are added in later phases.
+
+services:
+
+  # ── PostgreSQL 16 + pgvector ────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       socdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U postgres -d socdb"]
+      interval: 5s
+      timeout:  5s
+      retries:  10
+    networks:
+      - soc_net
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:     ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 5s
+      timeout:  5s
+      retries:  10
+    networks:
+      - soc_net
+
+  # ── HashiCorp Vault (dev mode — persists in-memory, resets on restart) ─────
+  vault:
+    image: hashicorp/vault:1.17
+    restart: unless-stopped
+    command: server -dev
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID:  ${VAULT_TOKEN}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"          # Vault UI available at http://localhost:8200
+    healthcheck:
+      test:         ["CMD-SHELL", "vault status -address=http://127.0.0.1:8200"]
+      interval:     5s
+      timeout:      5s
+      retries:      10
+      start_period: 5s
+    networks:
+      - soc_net
+
+  # ── Vault init (one-shot — loads all secrets then exits) ───────────────────
+  vault-init:
+    image: hashicorp/vault:1.17
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        vault kv put secret/soc-agent/claude_api_key         value="$$CLAUDE_API_KEY"
+        vault kv put secret/soc-agent/virustotal_api_key     value="$$VIRUSTOTAL_API_KEY"
+        vault kv put secret/soc-agent/abuseipdb_api_key      value="$$ABUSEIPDB_API_KEY"
+        vault kv put secret/soc-agent/alienvault_api_key     value="$$ALIENVAULT_API_KEY"
+        vault kv put secret/soc-agent/db_password            value="$$DB_PASSWORD"
+        vault kv put secret/soc-agent/redis_password         value="$$REDIS_PASSWORD"
+        vault kv put secret/soc-agent/service_token          value="$$SERVICE_TOKEN"
+        vault kv put secret/soc-agent/classifier_db_password value="$$CLASSIFIER_DB_PASSWORD"
+        vault kv put secret/soc-agent/profiler_db_password   value="$$PROFILER_DB_PASSWORD"
+        vault kv put secret/soc-agent/logger_db_password     value="$$LOGGER_DB_PASSWORD"
+        vault kv put secret/soc-agent/agent_db_password      value="$$AGENT_DB_PASSWORD"
+        vault kv put secret/soc-agent/dashboard_db_password  value="$$DASHBOARD_DB_PASSWORD"
+        [ -n "$$GREYNOISE_API_KEY" ] && vault kv put secret/soc-agent/greynoise_api_key value="$$GREYNOISE_API_KEY" || true
+        [ -n "$$SHODAN_API_KEY" ]    && vault kv put secret/soc-agent/shodan_api_key    value="$$SHODAN_API_KEY"    || true
+    environment:
+      VAULT_ADDR:               http://vault:8200
+      VAULT_TOKEN:              ${VAULT_TOKEN}
+      CLAUDE_API_KEY:           ${CLAUDE_API_KEY}
+      VIRUSTOTAL_API_KEY:       ${VIRUSTOTAL_API_KEY}
+      ABUSEIPDB_API_KEY:        ${ABUSEIPDB_API_KEY}
+      ALIENVAULT_API_KEY:       ${ALIENVAULT_API_KEY}
+      DB_PASSWORD:              ${DB_PASSWORD}
+      REDIS_PASSWORD:           ${REDIS_PASSWORD}
+      SERVICE_TOKEN:            ${SERVICE_TOKEN}
+      CLASSIFIER_DB_PASSWORD:   ${CLASSIFIER_DB_PASSWORD}
+      PROFILER_DB_PASSWORD:     ${PROFILER_DB_PASSWORD}
+      LOGGER_DB_PASSWORD:       ${LOGGER_DB_PASSWORD}
+      AGENT_DB_PASSWORD:        ${AGENT_DB_PASSWORD}
+      DASHBOARD_DB_PASSWORD:    ${DASHBOARD_DB_PASSWORD}
+      GREYNOISE_API_KEY:        ${GREYNOISE_API_KEY:-}
+      SHODAN_API_KEY:           ${SHODAN_API_KEY:-}
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks:
+      - soc_net
+
+  # ── Alembic migrations (one-shot — runs alembic upgrade head then exits) ───
+  migrate:
+    build:
+      context:    .
+      dockerfile: Dockerfile.migrate
+    environment:
+      # Connects as postgres superuser — has DDL rights to create tables and users
+      DATABASE_URL:           postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/socdb
+      # Per-user passwords read by migration 002_create_users
+      CLASSIFIER_DB_PASSWORD: ${CLASSIFIER_DB_PASSWORD}
+      PROFILER_DB_PASSWORD:   ${PROFILER_DB_PASSWORD}
+      LOGGER_DB_PASSWORD:     ${LOGGER_DB_PASSWORD}
+      AGENT_DB_PASSWORD:      ${AGENT_DB_PASSWORD}
+      DASHBOARD_DB_PASSWORD:  ${DASHBOARD_DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - soc_net
+
+networks:
+  soc_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
