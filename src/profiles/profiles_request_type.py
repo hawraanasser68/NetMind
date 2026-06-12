@@ -1,12 +1,17 @@
+import json
 import structlog
 
 from src.infra.infra_db import get_db_session
+from src.infra.infra_redis import get_redis_client
 from src.profiles.profiles_service import welford_update
 
 logger = structlog.get_logger(__name__)
 
-# Maps destination port → request type name.
-# Flows on unlisted ports are classified as UNKNOWN.
+PROFILE_CACHE_TTL = 3600   # Redis TTL in seconds
+
+_CACHE_KEY_PREFIX   = 'reqtype:'
+_POPULATION_SENTINEL = '0.0.0.0'
+
 _PORT_TO_REQUEST_TYPE = {
     80:  'HTTP',
     443: 'HTTPS',
@@ -16,13 +21,13 @@ _PORT_TO_REQUEST_TYPE = {
     25:  'SMTP',
 }
 
-_POPULATION_SENTINEL = '0.0.0.0'  # sentinel IP for population-level baselines (migration 008)
-
-_profile_cache: dict[tuple, dict] = {}   # (machine_ip, request_type) → profile dict
-
 
 def _request_type_for_port(dst_port: int) -> str:
     return _PORT_TO_REQUEST_TYPE.get(dst_port, 'UNKNOWN')
+
+
+def _cache_key(machine_ip: str, request_type: str) -> str:
+    return f'{_CACHE_KEY_PREFIX}{machine_ip}:{request_type}'
 
 
 def _empty_request_type_profile(machine_ip: str, request_type: str) -> dict:
@@ -39,12 +44,13 @@ def _empty_request_type_profile(machine_ip: str, request_type: str) -> dict:
 
 def _get_or_load_profile(machine_ip: str, request_type: str) -> dict:
     """
-    Cache-aside lookup.
-    Falls back to the population sentinel if no machine-specific row exists yet.
+    Cache-aside: Redis (hot, TTL 3600s) → PostgreSQL → population sentinel → empty.
+    Shared across all worker replicas via Redis.
     """
-    key = (machine_ip, request_type)
-    if key in _profile_cache:
-        return _profile_cache[key]
+    redis  = get_redis_client()
+    cached = redis.get(_cache_key(machine_ip, request_type))
+    if cached:
+        return json.loads(cached)
 
     conn = get_db_session()
     with conn.cursor() as cur:
@@ -57,7 +63,7 @@ def _get_or_load_profile(machine_ip: str, request_type: str) -> dict:
     if row:
         profile = dict(row)
     else:
-        # No machine-specific row yet — seed from the population baseline
+        # Seed from population baseline so the first flow has a meaningful reference
         with conn.cursor() as cur:
             cur.execute(
                 'SELECT * FROM request_type_profiles WHERE machine_ip = %s AND request_type = %s',
@@ -65,8 +71,8 @@ def _get_or_load_profile(machine_ip: str, request_type: str) -> dict:
             )
             seed = cur.fetchone()
 
-        if seed:
-            profile = {
+        profile = (
+            {
                 'machine_ip':   machine_ip,
                 'request_type': request_type,
                 'flow_count':   int(seed['flow_count']),
@@ -75,14 +81,25 @@ def _get_or_load_profile(machine_ip: str, request_type: str) -> dict:
                 'bytes_mean':   float(seed['bytes_mean']),
                 'bytes_m2':     float(seed['bytes_m2']),
             }
-        else:
-            profile = _empty_request_type_profile(machine_ip, request_type)
+            if seed
+            else _empty_request_type_profile(machine_ip, request_type)
+        )
 
-    _profile_cache[key] = profile
+    _write_redis(profile)
     return profile
 
 
-def _upsert_profile(profile: dict) -> None:
+def _write_redis(profile: dict) -> None:
+    """Write profile to Redis. Called on every flow — keeps all replicas in sync."""
+    get_redis_client().set(
+        _cache_key(profile['machine_ip'], profile['request_type']),
+        json.dumps(profile, default=str),
+        ex=PROFILE_CACHE_TTL,
+    )
+
+
+def _upsert_db(profile: dict) -> None:
+    """Persist profile to PostgreSQL. Called every 10 flows."""
     conn = get_db_session()
     with conn.cursor() as cur:
         cur.execute("""
@@ -104,7 +121,8 @@ def _upsert_profile(profile: dict) -> None:
 def update_request_type_profile(flow: dict) -> dict:
     """
     Update the per-(machine, request_type) profile for one flow.
-    Returns the current profile (used by the deviation formula).
+    Redis updated on every flow; PostgreSQL every 10 flows.
+    Returns the updated profile (used by the deviation formula).
     """
     machine_ip   = flow['machine_ip']
     dst_port     = int(flow.get('dst_port', 0))
@@ -127,7 +145,9 @@ def update_request_type_profile(flow: dict) -> dict:
         profile['first_seen'] = captured_at
     profile['last_seen'] = captured_at
 
+    _write_redis(profile)
+
     if n % 10 == 0:
-        _upsert_profile(profile)
+        _upsert_db(profile)
 
     return profile

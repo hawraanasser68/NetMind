@@ -1,20 +1,20 @@
 import ipaddress
+import json
 import structlog
 from sentence_transformers import SentenceTransformer
 
 from src.infra.infra_db import get_db_session
+from src.infra.infra_redis import get_redis_client
 from src.profiles.profiles_service import welford_update
 
 logger = structlog.get_logger(__name__)
 
-# New machines are buffered in memory until they reach GRADUATION_THRESHOLD flows.
-# Below this count, the deviation formula treats them as new-machine HIGH risk.
 GRADUATION_THRESHOLD = 10
-SNAPSHOT_INTERVAL    = 100   # generate a pgvector embedding every N flows
-SNAPSHOT_KEEP        = 10    # retain only the latest N snapshots per machine
+SNAPSHOT_INTERVAL    = 100
+SNAPSHOT_KEEP        = 10
+PROFILE_CACHE_TTL    = 3600   # Redis TTL in seconds
 
-_profile_cache: dict[str, dict] = {}   # machine_ip → profile dict
-_new_machine_buffer: dict[str, list] = {}  # machine_ip → list of flows (pre-graduation)
+_CACHE_KEY_PREFIX = 'profile:'
 
 _embedder: SentenceTransformer | None = None
 
@@ -27,11 +27,14 @@ def _get_embedder() -> SentenceTransformer:
 
 
 def _is_rfc1918(ip: str) -> bool:
-    """Return True if the IP is a private (RFC 1918) address."""
     try:
         return ipaddress.ip_address(ip).is_private
     except ValueError:
         return False
+
+
+def _cache_key(machine_ip: str) -> str:
+    return f'{_CACHE_KEY_PREFIX}{machine_ip}'
 
 
 def _empty_profile(machine_ip: str) -> dict:
@@ -51,16 +54,18 @@ def _empty_profile(machine_ip: str) -> dict:
 
 
 def _get_or_load_profile(machine_ip: str) -> dict:
-    """Cache-aside: return from memory, or load from DB, or return empty."""
-    if machine_ip in _profile_cache:
-        return _profile_cache[machine_ip]
+    """
+    Cache-aside: Redis (hot, TTL 3600s) → PostgreSQL → empty profile.
+    Shared across all worker replicas via Redis.
+    """
+    redis  = get_redis_client()
+    cached = redis.get(_cache_key(machine_ip))
+    if cached:
+        return json.loads(cached)
 
     conn = get_db_session()
     with conn.cursor() as cur:
-        cur.execute(
-            'SELECT * FROM machine_profiles WHERE machine_ip = %s',
-            (machine_ip,),
-        )
+        cur.execute('SELECT * FROM machine_profiles WHERE machine_ip = %s', (machine_ip,))
         row = cur.fetchone()
 
     if row:
@@ -70,12 +75,21 @@ def _get_or_load_profile(machine_ip: str) -> dict:
     else:
         profile = _empty_profile(machine_ip)
 
-    _profile_cache[machine_ip] = profile
+    _write_redis(profile)
     return profile
 
 
-def _upsert_profile(profile: dict) -> None:
-    """Write the in-memory profile to PostgreSQL (INSERT or UPDATE)."""
+def _write_redis(profile: dict) -> None:
+    """Write profile to Redis. Called on every flow — keeps all replicas in sync."""
+    get_redis_client().set(
+        _cache_key(profile['machine_ip']),
+        json.dumps(profile, default=str),
+        ex=PROFILE_CACHE_TTL,
+    )
+
+
+def _upsert_db(profile: dict) -> None:
+    """Persist profile to PostgreSQL. Called every 10 flows."""
     conn = get_db_session()
     with conn.cursor() as cur:
         cur.execute("""
@@ -111,9 +125,8 @@ def _upsert_profile(profile: dict) -> None:
 
 def maybe_generate_snapshot(machine_ip: str, profile: dict) -> None:
     """
-    Every SNAPSHOT_INTERVAL flows, embed a summary of the machine profile and
-    insert it into machine_history for RAG retrieval by the agent.
-    Keeps only the latest SNAPSHOT_KEEP entries per machine.
+    Every SNAPSHOT_INTERVAL flows: embed a plain-English summary and store it
+    in machine_history for pgvector RAG retrieval. Prunes to SNAPSHOT_KEEP entries.
     """
     if profile['flow_count'] % SNAPSHOT_INTERVAL != 0:
         return
@@ -136,7 +149,6 @@ def maybe_generate_snapshot(machine_ip: str, profile: dict) -> None:
             VALUES (%s, %s, %s::vector)
         """, (machine_ip, summary, str(embedding)))
 
-        # Prune old snapshots — keep only the latest SNAPSHOT_KEEP rows
         cur.execute("""
             DELETE FROM machine_history
             WHERE machine_ip = %s
@@ -154,54 +166,33 @@ def maybe_generate_snapshot(machine_ip: str, profile: dict) -> None:
 
 def update_machine_profile(flow: dict) -> dict:
     """
-    Update the machine profile for one flow. Returns the current profile.
-
-    New machines are buffered until GRADUATION_THRESHOLD flows — they are
-    treated as high-risk by the scorer until graduation.
+    Update the machine profile for one flow. Returns the updated profile.
+    New machines are buffered until GRADUATION_THRESHOLD flows.
+    Redis is updated on every flow; PostgreSQL every 10 flows.
     """
     machine_ip = flow['machine_ip']
-    features   = flow.get('features', [])
+    profile    = _get_or_load_profile(machine_ip)
 
-    fwd_bytes  = features[2] if len(features) > 2 else 0.0
-    bwd_bytes  = features[3] if len(features) > 3 else 0.0
-    total_bytes = fwd_bytes + bwd_bytes
-    byts_per_s  = features[4] if len(features) > 4 else 0.0
-    tot_pkts    = (features[0] + features[1]) if len(features) > 1 else 0.0
-    duration    = features[8] if len(features) > 8 else 0.0
-    byte_ratio  = features[28] if len(features) > 28 else 0.5
-    dst_port    = int(flow.get('dst_port', 0))
-    protocol    = int(flow.get('protocol', 0))
-    captured_at = flow.get('captured_at')
+    _apply_flow_to_profile(profile, flow)
+    _write_redis(profile)
 
-    profile = _get_or_load_profile(machine_ip)
-
-    # Buffer pre-graduation flows without touching the DB
     if profile['flow_count'] < GRADUATION_THRESHOLD:
-        buf = _new_machine_buffer.setdefault(machine_ip, [])
-        buf.append(flow)
-
-        if len(buf) >= GRADUATION_THRESHOLD:
-            # Graduate: replay all buffered flows into the profile at once
-            for buffered_flow in buf:
-                _apply_flow_to_profile(profile, buffered_flow)
-            del _new_machine_buffer[machine_ip]
-            _upsert_profile(profile)
-            logger.info('Machine graduated from buffer', machine_ip=machine_ip)
         return profile
 
-    # Normal update path (post-graduation)
-    _apply_flow_to_profile(profile, flow)
+    if profile['flow_count'] == GRADUATION_THRESHOLD:
+        _upsert_db(profile)
+        logger.info('Machine graduated from buffer', machine_ip=machine_ip)
+        return profile
 
     if profile['flow_count'] % 10 == 0:
-        _upsert_profile(profile)
+        _upsert_db(profile)
 
     maybe_generate_snapshot(machine_ip, profile)
-
     return profile
 
 
 def _apply_flow_to_profile(profile: dict, flow: dict) -> None:
-    """Mutate profile in-place with one flow's data."""
+    """Mutate profile in-place: Welford updates for all 5 stats, port/protocol arrays."""
     features    = flow.get('features', [])
     fwd_bytes   = features[2] if len(features) > 2 else 0.0
     bwd_bytes   = features[3] if len(features) > 3 else 0.0

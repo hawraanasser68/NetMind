@@ -24,7 +24,8 @@ MAX_SECONDS    = 30
 OSINT_TOOLS    = {'lookup_ip_vt', 'lookup_ip_abuse', 'lookup_threats', 'whois_domain', 'lookup_ports'}
 INTERNAL_TOOLS = {'rag_search', 'generate_rule', 'escalate'}
 
-_embedder: SentenceTransformer | None = None
+_embedder:       SentenceTransformer | None = None
+_anthropic_client: anthropic.Anthropic | None = None
 
 _INJECTION_PATTERNS = [
     'ignore previous instructions',
@@ -40,6 +41,13 @@ def _get_embedder() -> SentenceTransformer:
     if _embedder is None:
         _embedder = SentenceTransformer('all-MiniLM-L6-v2')
     return _embedder
+
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(api_key=get_secret('claude_api_key'))
+    return _anthropic_client
 
 
 def _is_rfc1918(ip: str) -> bool:
@@ -170,7 +178,7 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
     Main agent loop. Loads session, retrieves RAG history, calls tools, returns finding.
     Budget: MAX_TOOL_CALLS calls or MAX_SECONDS, whichever hits first.
     """
-    client = anthropic.Anthropic(api_key=get_secret('claude_api_key'))
+    client = _get_anthropic_client()
     budget = AgentBudget()
 
     machine_ip = flow.get('machine_ip', 'unknown')
