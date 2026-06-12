@@ -4,7 +4,7 @@ models/scaler.pkl
 __pycache__/
 *.pyc
 *.egg-info/
-data/
+/data/
 .DS_Store
 
 # Claude Code internals

@@ -1,8 +1,8 @@
 version: '3.9'
 
-# ── Base services (Phase 2) ───────────────────────────────────────────────────
-# Bring up with: docker compose up postgres redis vault vault-init migrate
-# App services (classifier, workers, agent, dashboard) are added in later phases.
+# ── Services ──────────────────────────────────────────────────────────────────
+# Base only:    docker compose up postgres redis vault vault-init migrate
+# + Phase 3:    docker compose up logger classifier-worker
 
 services:
 
@@ -120,6 +120,52 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - soc_net
+
+  # ── Logger worker (Phase 3) ────────────────────────────────────────────────
+  logger:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m src.data.data_logger_worker
+    environment:
+      VAULT_ADDR:   http://vault:8200
+      VAULT_TOKEN:  ${VAULT_TOKEN}
+      DB_HOST:      postgres
+      DB_PORT:      5432
+      DB_NAME:      socdb
+      DB_USER:      logger_user
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - soc_net
+
+  # ── Classifier worker (Phase 3) ────────────────────────────────────────────
+  classifier-worker:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m src.data.data_classifier_worker
+    environment:
+      VAULT_ADDR:   http://vault:8200
+      VAULT_TOKEN:  ${VAULT_TOKEN}
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       vault-init:
         condition: service_completed_successfully
     networks:
