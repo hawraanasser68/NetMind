@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.infra.infra_logging import configure_logging
-from src.infra.infra_secrets import load_secrets
+from src.infra.infra_vault import load_secrets
 from src.profiles.profiles_router import router
 
 configure_logging()
