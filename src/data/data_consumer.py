@@ -11,7 +11,7 @@ MAXLEN_NETWORK_FLOWS  = 100_000
 MAXLEN_HIGH_RISK      = 10_000
 
 _GROUPS = {
-    STREAM_NETWORK_FLOWS: ['logger-group', 'classifier-group'],
+    STREAM_NETWORK_FLOWS: ['logger-group', 'classifier-group', 'profilers'],
     STREAM_HIGH_RISK:     ['agent-group'],
 }
 

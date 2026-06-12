@@ -1,0 +1,133 @@
+import structlog
+
+from src.infra.infra_db import get_db_session
+from src.profiles.profiles_service import welford_update
+
+logger = structlog.get_logger(__name__)
+
+# Maps destination port → request type name.
+# Flows on unlisted ports are classified as UNKNOWN.
+_PORT_TO_REQUEST_TYPE = {
+    80:  'HTTP',
+    443: 'HTTPS',
+    53:  'DNS',
+    22:  'SSH',
+    21:  'FTP',
+    25:  'SMTP',
+}
+
+_POPULATION_SENTINEL = '0.0.0.0'  # sentinel IP for population-level baselines (migration 008)
+
+_profile_cache: dict[tuple, dict] = {}   # (machine_ip, request_type) → profile dict
+
+
+def _request_type_for_port(dst_port: int) -> str:
+    return _PORT_TO_REQUEST_TYPE.get(dst_port, 'UNKNOWN')
+
+
+def _empty_request_type_profile(machine_ip: str, request_type: str) -> dict:
+    return {
+        'machine_ip':   machine_ip,
+        'request_type': request_type,
+        'flow_count':   0,
+        'first_seen':   None,
+        'last_seen':    None,
+        'bytes_mean':   0.0,
+        'bytes_m2':     0.0,
+    }
+
+
+def _get_or_load_profile(machine_ip: str, request_type: str) -> dict:
+    """
+    Cache-aside lookup.
+    Falls back to the population sentinel if no machine-specific row exists yet.
+    """
+    key = (machine_ip, request_type)
+    if key in _profile_cache:
+        return _profile_cache[key]
+
+    conn = get_db_session()
+    with conn.cursor() as cur:
+        cur.execute(
+            'SELECT * FROM request_type_profiles WHERE machine_ip = %s AND request_type = %s',
+            (machine_ip, request_type),
+        )
+        row = cur.fetchone()
+
+    if row:
+        profile = dict(row)
+    else:
+        # No machine-specific row yet — seed from the population baseline
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT * FROM request_type_profiles WHERE machine_ip = %s AND request_type = %s',
+                (_POPULATION_SENTINEL, request_type),
+            )
+            seed = cur.fetchone()
+
+        if seed:
+            profile = {
+                'machine_ip':   machine_ip,
+                'request_type': request_type,
+                'flow_count':   int(seed['flow_count']),
+                'first_seen':   None,
+                'last_seen':    None,
+                'bytes_mean':   float(seed['bytes_mean']),
+                'bytes_m2':     float(seed['bytes_m2']),
+            }
+        else:
+            profile = _empty_request_type_profile(machine_ip, request_type)
+
+    _profile_cache[key] = profile
+    return profile
+
+
+def _upsert_profile(profile: dict) -> None:
+    conn = get_db_session()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO request_type_profiles
+                (machine_ip, request_type, flow_count, first_seen, last_seen,
+                 bytes_mean, bytes_m2)
+            VALUES
+                (%(machine_ip)s, %(request_type)s, %(flow_count)s, %(first_seen)s,
+                 %(last_seen)s, %(bytes_mean)s, %(bytes_m2)s)
+            ON CONFLICT (machine_ip, request_type) DO UPDATE SET
+                flow_count = EXCLUDED.flow_count,
+                last_seen  = EXCLUDED.last_seen,
+                bytes_mean = EXCLUDED.bytes_mean,
+                bytes_m2   = EXCLUDED.bytes_m2
+        """, profile)
+    conn.commit()
+
+
+def update_request_type_profile(flow: dict) -> dict:
+    """
+    Update the per-(machine, request_type) profile for one flow.
+    Returns the current profile (used by the deviation formula).
+    """
+    machine_ip   = flow['machine_ip']
+    dst_port     = int(flow.get('dst_port', 0))
+    request_type = _request_type_for_port(dst_port)
+    captured_at  = flow.get('captured_at')
+
+    features    = flow.get('features', [])
+    fwd_bytes   = features[2] if len(features) > 2 else 0.0
+    bwd_bytes   = features[3] if len(features) > 3 else 0.0
+    total_bytes = fwd_bytes + bwd_bytes
+
+    profile = _get_or_load_profile(machine_ip, request_type)
+
+    profile['bytes_mean'], profile['bytes_m2'], n = welford_update(
+        profile['bytes_mean'], profile['bytes_m2'], profile['flow_count'], total_bytes,
+    )
+    profile['flow_count'] = n
+
+    if profile['first_seen'] is None:
+        profile['first_seen'] = captured_at
+    profile['last_seen'] = captured_at
+
+    if n % 10 == 0:
+        _upsert_profile(profile)
+
+    return profile
