@@ -125,6 +125,34 @@ services:
     networks:
       - soc_net
 
+  # ── ML Classifier service (Phase 4) ───────────────────────────────────────
+  classifier:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m uvicorn src.ml.ml_main:app --host 0.0.0.0 --port 8001
+    environment:
+      VAULT_ADDR:  http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN}
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./models:/app/models:ro    # model files are read-only inside the container
+    healthcheck:
+      test:     ["CMD-SHELL", "curl -sf http://localhost:8001/classifier/health"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 15s            # model load + vault auth takes a few seconds
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - soc_net
+
   # ── Logger worker (Phase 3) ────────────────────────────────────────────────
   logger:
     build:
@@ -168,6 +196,8 @@ services:
         condition: service_completed_successfully
       vault-init:
         condition: service_completed_successfully
+      classifier:
+        condition: service_healthy
     networks:
       - soc_net
 

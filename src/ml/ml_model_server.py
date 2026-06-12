@@ -1,9 +1,14 @@
-import joblib
-import json
 import hashlib
+import json
+import joblib
 import numpy as np
+import structlog
 from pathlib import Path
 
+from src.infra.infra_errors import ModelSHA256Mismatch
+from src.ml.ml_feature_contract import N_FEATURES, CLASS_NAMES
+
+logger     = structlog.get_logger(__name__)
 MODELS_DIR = Path('models/')
 
 
@@ -12,12 +17,16 @@ class ModelServer:
         self.pipeline   = None
         self.model_card = None
 
-    def load(self):
-        """Load Pipeline artifact and validate SHA-256. Raises RuntimeError on any failure."""
+    def load(self) -> None:
+        """
+        Load the LightGBM pipeline and validate its SHA-256 against model_card.json.
+        Raises ModelSHA256Mismatch if the file has been tampered with.
+        Raises RuntimeError if required files are missing.
+        """
         card_path = MODELS_DIR / 'model_card.json'
         if not card_path.exists():
             raise RuntimeError(
-                'Model card not found. '
+                'model_card.json not found. '
                 'Run notebooks/train_classifier.ipynb before starting the service.'
             )
         with open(card_path) as f:
@@ -33,33 +42,43 @@ class ModelServer:
         with open(model_path, 'rb') as f:
             actual_sha256 = hashlib.sha256(f.read()).hexdigest()
 
-        expected_sha256 = self.model_card['sha256']
+        expected_sha256 = self.model_card.get('sha256', '')
         if actual_sha256 != expected_sha256:
-            raise RuntimeError(
-                f'Model SHA-256 mismatch. '
-                f'Expected: {expected_sha256}. '
-                f'Got: {actual_sha256}. '
-                f'Refusing to start — model may have been tampered with.'
+            raise ModelSHA256Mismatch(
+                f'SHA-256 mismatch — model may have been tampered with. '
+                f'Expected {expected_sha256[:16]}..., got {actual_sha256[:16]}...'
             )
 
         self.pipeline = joblib.load(model_path)
+        logger.info(
+            'Model loaded',
+            model_type=self.model_card.get('model_type'),
+            sha256_prefix=actual_sha256[:16],
+            n_features=N_FEATURES,
+        )
 
-        print(f"Model loaded: {self.model_card['model_type']}")
-        print(f"SHA-256 validated: {actual_sha256[:16]}...")
+    def predict(self, features: list[float]) -> dict:
+        """
+        Score a single flow. features must be exactly N_FEATURES values
+        in FEATURE_COLUMNS order.
 
-    def predict(self, features: list) -> dict:
-        """Score a single flow. features must be in FEATURE_COLUMNS order (33 values)."""
+        Returns a dict matching ScoreResponse fields.
+        """
         if self.pipeline is None:
             raise RuntimeError('Model not loaded. Call load() first.')
 
-        proba = self.pipeline.predict_proba([features])[0]
+        proba           = self.pipeline.predict_proba([features])[0]
+        predicted_class = int(np.argmax(proba))
 
         return {
-            'benign_probability':     float(proba[0]),
-            'suspicious_probability': float(proba[1]),
-            'attack_probability':     float(proba[2]),
-            'classifier_score':       float(proba[1] + proba[2]),
-            'predicted_class':        int(np.argmax(proba)),
+            'label':      predicted_class,
+            'confidence': float(proba[predicted_class]),
+            'probabilities': {
+                CLASS_NAMES[0]: float(proba[0]),   # benign
+                CLASS_NAMES[1]: float(proba[1]),   # suspicious
+                CLASS_NAMES[2]: float(proba[2]),   # attack
+            },
+            'classifier_score': float(proba[1] + proba[2]),
         }
 
 
