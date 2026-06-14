@@ -201,6 +201,30 @@ services:
     networks:
       - soc_net
 
+  # ── Guardrails sidecar (Phase 8) ──────────────────────────────────────────
+  guardrails:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m uvicorn src.guardrails.guardrails_main:app --host 0.0.0.0 --port 8004
+    environment:
+      VAULT_ADDR:   http://vault:8200
+      VAULT_TOKEN:  ${VAULT_TOKEN}
+    ports:
+      - "8004:8004"
+    healthcheck:
+      test:     ["CMD-SHELL", "curl -sf http://localhost:8004/guardrails/health"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 10s
+    depends_on:
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - soc_net
+
   # ── LLM Agent service (Phase 7) ───────────────────────────────────────────
   agent:
     build:
@@ -228,6 +252,8 @@ services:
         condition: service_completed_successfully
       vault-init:
         condition: service_completed_successfully
+      guardrails:
+        condition: service_healthy
     networks:
       - soc_net
 

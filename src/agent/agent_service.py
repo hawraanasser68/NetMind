@@ -1,9 +1,11 @@
 import ipaddress
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import anthropic
+import requests
+import structlog
 from sentence_transformers import SentenceTransformer
 
 from src.agent.agent_osint import call_osint_tool
@@ -17,6 +19,11 @@ from src.agent.agent_tools import TOOLS
 from src.infra.infra_redaction import redact
 from src.infra.infra_vault import get_secret
 
+logger = structlog.get_logger(__name__)
+
+_GUARDRAILS_URL     = 'http://guardrails:8004/guardrails'
+_GUARDRAILS_TIMEOUT = 5  # seconds — fail open if sidecar is unavailable
+
 MAX_TOOL_CALLS = 5
 MAX_TOKENS     = 1000
 MAX_SECONDS    = 30
@@ -26,14 +33,6 @@ INTERNAL_TOOLS = {'rag_search', 'generate_rule', 'escalate'}
 
 _embedder:       SentenceTransformer | None = None
 _anthropic_client: anthropic.Anthropic | None = None
-
-_INJECTION_PATTERNS = [
-    'ignore previous instructions',
-    'disregard your system prompt',
-    'you are now',
-    'forget everything',
-    'new instructions',
-]
 
 
 def _get_embedder() -> SentenceTransformer:
@@ -48,6 +47,29 @@ def _get_anthropic_client() -> anthropic.Anthropic:
     if _anthropic_client is None:
         _anthropic_client = anthropic.Anthropic(api_key=get_secret('claude_api_key'))
     return _anthropic_client
+
+
+def _guardrails_headers() -> dict:
+    return {'Authorization': f'Bearer {get_secret("service_token")}'}
+
+
+def _guardrails_post(endpoint: str, payload: dict) -> dict:
+    """
+    POST to the guardrails sidecar. Fails open on any network/timeout error —
+    a guardrails outage must not stop the investigation.
+    """
+    try:
+        resp = requests.post(
+            f'{_GUARDRAILS_URL}/{endpoint}',
+            json=payload,
+            headers=_guardrails_headers(),
+            timeout=_GUARDRAILS_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning('Guardrails sidecar unreachable — failing open', endpoint=endpoint, error=str(e))
+        return {'approved': True, 'sanitized_result': payload.get('tool_result', ''), 'was_modified': False}
 
 
 def _is_rfc1918(ip: str) -> bool:
@@ -84,7 +106,7 @@ def get_session_context(machine_ip: str, redis) -> dict:
     return {
         'machine_ip':        machine_ip,
         'flows_this_window': 0,
-        'first_seen':        datetime.utcnow().isoformat(),
+        'first_seen':        datetime.now(timezone.utc).isoformat(),
         'agent_context':     '',
     }
 
@@ -130,38 +152,6 @@ def build_deviation_signals(components: dict) -> str:
     return '; '.join(signals) if signals else 'moderate deviation'
 
 
-def _validate_tool_call(tool_name: str, args: dict, flow: dict, budget: AgentBudget) -> dict:
-    if tool_name in OSINT_TOOLS:
-        if _is_rfc1918(flow.get('machine_ip', '')):
-            return {'approved': False, 'reason': 'OSINT not applicable to internal IPs'}
-        if budget.tool_calls_remaining < 2:
-            return {'approved': False, 'reason': 'Insufficient budget for OSINT'}
-
-    if tool_name == 'generate_rule':
-        if args.get('src_ip') != flow.get('machine_ip'):
-            return {'approved': False, 'reason': 'Rule target must match flow source IP'}
-        if args.get('action') not in ('DROP', 'REJECT', None):
-            return {'approved': False, 'reason': 'Action must be DROP or REJECT'}
-        if _is_rfc1918(args.get('src_ip', '')):
-            if flow.get('risk_level') != 'CRITICAL':
-                return {'approved': False, 'reason': 'Cannot block internal IP unless CRITICAL risk'}
-
-    if tool_name == 'escalate':
-        if not args.get('reason'):
-            return {'approved': False, 'reason': 'Escalation reason must not be empty'}
-        if args.get('priority') not in ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL'):
-            return {'approved': False, 'reason': 'Invalid priority level'}
-
-    return {'approved': True, 'reason': None}
-
-
-def _validate_tool_result(result: str) -> str:
-    lower = result.lower()
-    for pattern in _INJECTION_PATTERNS:
-        if pattern in lower:
-            return '[Tool result contained suspicious content and was sanitized for security.]'
-    return result
-
 
 def _build_iptables_rule(args: dict) -> str:
     src_ip   = args['src_ip']
@@ -182,7 +172,31 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
     budget = AgentBudget()
 
     machine_ip = flow.get('machine_ip', 'unknown')
-    session    = get_session_context(machine_ip, redis)
+
+    # Point 1 — check all flow field values for injection before agent sees them
+    input_check = _guardrails_post('check_input', {
+        'flow_id':     flow.get('flow_id', ''),
+        'flow_fields': {k: v for k, v in flow.items() if k != 'features'},
+    })
+    if not input_check.get('approved', True):
+        logger.warning('Guardrails rejected flow input', reason=input_check.get('reason'), machine_ip=machine_ip)
+        return {
+            'flow_id':            flow.get('flow_id', ''),
+            'risk_level':         scoring_result.get('risk_level', 'HIGH'),
+            'classifier_score':   float(scoring_result.get('classifier_score', 0.0)),
+            'deviation_score':    float(scoring_result.get('risk_score', 0.0)),
+            'machine_confidence': float(scoring_result.get('ml_confidence', 0.0)),
+            'explanation':        f"Flow flagged by input guardrail: {input_check.get('reason')}",
+            'firewall_rule':      None,
+            'tools_called':       [],
+            'osint_results':      {},
+            'escalated_to_human': True,
+            'limit_hit':          False,
+            'limit_reason':       None,
+            'confidence':         'LOW',
+        }
+
+    session = get_session_context(machine_ip, redis)
 
     session_context = (
         f"This machine has triggered {session['flows_this_window']} "
@@ -203,7 +217,7 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
         protocol          = flow.get('protocol', 'unknown'),
         total_bytes       = total_bytes,
         duration          = float(duration),
-        hour              = datetime.utcnow().hour,
+        hour              = datetime.now(timezone.utc).hour,
         is_external       = not _is_rfc1918(machine_ip),
         risk_level        = scoring_result.get('risk_level', 'HIGH'),
         classifier_score  = float(scoring_result.get('classifier_score', 0.0)),
@@ -257,12 +271,18 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             tool_name = block.name
             tool_args = block.input
 
-            validation = _validate_tool_call(tool_name, tool_args, flow, budget)
-            if not validation['approved']:
+            # Point 2 — validate tool call via guardrails sidecar
+            tool_check = _guardrails_post('check_tool_call', {
+                'flow_id':   flow.get('flow_id', ''),
+                'tool_name': tool_name,
+                'tool_args': tool_args,
+                'flow':      flow,
+            })
+            if not tool_check.get('approved', True):
                 tool_results.append({
                     'type':        'tool_result',
                     'tool_use_id': block.id,
-                    'content':     f"Tool call rejected: {validation['reason']}",
+                    'content':     f"Tool call rejected: {tool_check.get('reason')}",
                 })
                 continue
 
@@ -288,7 +308,15 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             else:
                 result = f'Unknown tool: {tool_name}'
 
-            result = _validate_tool_result(str(result))
+            # Point 3 — sanitize tool result via guardrails sidecar
+            result_check = _guardrails_post('check_tool_result', {
+                'flow_id':     flow.get('flow_id', ''),
+                'tool_name':   tool_name,
+                'tool_result': str(result),
+            })
+            result = result_check.get('sanitized_result', str(result))
+            if result_check.get('was_modified'):
+                messages.append({'role': 'user', 'content': INJECTION_DETECTED_PROMPT})
 
             tool_results.append({
                 'type':        'tool_result',
@@ -313,6 +341,24 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
         'limit_reason':       limit_reason,
         'confidence':         'LOW' if limit_hit else 'HIGH',
     }
+
+    # Point 4 — validate finding consistency before writing to security_alerts
+    finding_check = _guardrails_post('check_finding', {
+        'flow_id':          finding['flow_id'],
+        'risk_level':       finding['risk_level'],
+        'classifier_score': finding['classifier_score'],
+        'explanation':      finding['explanation'],
+        'firewall_rule':    finding['firewall_rule'],
+        'limit_hit':        finding['limit_hit'],
+    })
+    if not finding_check.get('approved', True):
+        logger.warning('Guardrails rejected finding', reason=finding_check.get('reason'), flow_id=finding['flow_id'])
+        finding['firewall_rule']      = None
+        finding['escalated_to_human'] = True
+        finding['explanation']        = (
+            f"{finding['explanation']} "
+            f"[Finding modified by guardrail: {finding_check.get('reason')}]"
+        )
 
     update_session(session, finding, redis)
     return finding
