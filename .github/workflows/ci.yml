@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit tests (pure functions)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pydantic pyyaml pytest
+
+      - name: Run unit tests
+        run: pytest tests/test_profiles.py tests/test_guardrails.py tests/test_scoring.py
+
+  classifier-gate:
+    name: Classifier CI gate
+    runs-on: ubuntu-latest
+    # Does not block PRs — tests self-skip when model artifacts are absent.
+    # To enforce the gate, upload models/test_set.npz and eval_thresholds.yaml
+    # as encrypted repo secrets or a release artifact and download them here.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install ML dependencies
+        run: pip install numpy scikit-learn lightgbm joblib pyyaml pytest structlog sentence-transformers
+
+      - name: Run classifier tests
+        run: pytest tests/test_classifier.py -v
