@@ -42,7 +42,7 @@ jobs:
           cache: pip
 
       - name: Install ML dependencies
-        run: pip install numpy scikit-learn lightgbm joblib pyyaml pytest structlog sentence-transformers
+        run: pip install "scikit-learn==1.5.2" numpy lightgbm joblib pyyaml pytest structlog sentence-transformers
 
       - name: Run classifier tests
         run: pytest tests/test_classifier.py -v
