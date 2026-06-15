@@ -1,5 +1,4 @@
 .env
-models/*.pkl
 models/scaler.pkl
 __pycache__/
 *.pyc
