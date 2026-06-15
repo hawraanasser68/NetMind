@@ -25,13 +25,36 @@ jobs:
       - name: Run unit tests
         run: pytest tests/test_profiles.py tests/test_guardrails.py tests/test_scoring.py
 
+  integration-tests:
+    name: Integration tests (HTTP + routing)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            fastapi "httpx>=0.23" pydantic pyyaml pytest structlog hvac requests \
+            redis psycopg2-binary \
+            "scikit-learn==1.5.2" numpy lightgbm joblib
+
+      - name: Run integration tests
+        run: |
+          pytest \
+            tests/test_scoring_integration.py \
+            tests/test_classifier_http.py \
+            tests/test_guardrails_http.py \
+            tests/test_pipeline_routing.py
+
   classifier-gate:
     name: Classifier CI gate
     runs-on: ubuntu-latest
-    # Does not block PRs — tests self-skip when model artifacts are absent.
-    # To enforce the gate, upload models/test_set.npz and eval_thresholds.yaml
-    # as encrypted repo secrets or a release artifact and download them here.
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +65,7 @@ jobs:
           cache: pip
 
       - name: Install ML dependencies
-        run: pip install "scikit-learn==1.5.2" numpy lightgbm joblib pyyaml pytest structlog sentence-transformers
+        run: pip install "scikit-learn==1.5.2" numpy lightgbm joblib pyyaml pytest structlog
 
       - name: Run classifier tests
         run: pytest tests/test_classifier.py -v

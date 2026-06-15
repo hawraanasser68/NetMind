@@ -44,10 +44,7 @@ class ModelServer:
 
         expected_sha256 = self.model_card.get('sha256', '')
         if actual_sha256 != expected_sha256:
-            raise ModelSHA256Mismatch(
-                f'SHA-256 mismatch — model may have been tampered with. '
-                f'Expected {expected_sha256[:16]}..., got {actual_sha256[:16]}...'
-            )
+            raise ModelSHA256Mismatch(expected_sha256, actual_sha256)
 
         self.pipeline = joblib.load(model_path)
         logger.info(

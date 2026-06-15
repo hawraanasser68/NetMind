@@ -11,9 +11,7 @@ router = APIRouter(prefix='/classifier', tags=['classifier'])
 @router.post('/score', response_model=ScoreResponse)
 def score(request: ScoreRequest) -> ScoreResponse:
     if len(request.features) != N_FEATURES:
-        raise InvalidFeatureCount(
-            f'Expected {N_FEATURES} features, got {len(request.features)}.'
-        )
+        raise InvalidFeatureCount(N_FEATURES, len(request.features))
     result = model_server.predict(request.features)
     return ScoreResponse(flow_id=request.flow_id, **result)
 
