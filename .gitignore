@@ -22,5 +22,6 @@ notebooks/
 
 # Detection tuning — keep off public repos
 specs/
-config/
+config/*
+!config/deviation_weights.yaml
 eval_thresholds.yaml

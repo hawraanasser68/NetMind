@@ -23,8 +23,3 @@ routing_thresholds:
   medium_deviation:      0.80
   low_deviation:         0.60
   low_confidence_max:    0.30
-```
-
----
-
-## scoring_deviation.py
