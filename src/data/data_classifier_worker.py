@@ -5,6 +5,8 @@ import structlog
 
 from src.infra.infra_logging import configure_logging
 from src.infra.infra_vault import load_secrets
+from src.profiles.profiles_machine import get_machine_profile
+from src.profiles.profiles_request_type import get_request_type_profile
 from src.data.data_consumer import (
     STREAM_NETWORK_FLOWS,
     ack_message,
@@ -68,15 +70,17 @@ def classify_and_route(flow: dict) -> None:
     result           = _call_classifier(flow['features'])
     classifier_score = result.get('classifier_score', _NEUTRAL['classifier_score'])
 
-    # Try the full risk scorer (Phase 5). Import is deferred so Phase 3 runs
-    # before Phase 5 exists — Python caches the ImportError after the first attempt.
+    machine_ip          = flow.get('machine_ip', '')
+    machine_profile     = get_machine_profile(machine_ip)
+    request_type_profile = get_request_type_profile(machine_ip, int(flow.get('dst_port', 0)))
+
     try:
         from src.scoring.scoring_service import score_flow, should_escalate_to_agent
         scoring = score_flow(
             flow=flow,
             classifier_result=result,
-            machine_profile=None,       # Phase 6 — not yet available
-            request_type_profile=None,  # Phase 6 — not yet available
+            machine_profile=machine_profile,
+            request_type_profile=request_type_profile,
         )
         risk_level = scoring.risk_level
         risk_score = scoring.risk_score

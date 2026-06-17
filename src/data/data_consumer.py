@@ -17,7 +17,9 @@ _GROUPS = {
 
 
 def initialize_streams() -> None:
-    """Create streams and consumer groups if they do not already exist."""
+    """Create streams and consumer groups if they do not already exist.
+    Safe to call on every worker startup — silently skips groups that already exist.
+    """
     redis = get_redis_client()
     for stream, groups in _GROUPS.items():
         for group in groups:
@@ -44,34 +46,47 @@ def consume_stream(
     Pending-then-new pattern:
     1. Drain any unacknowledged messages left over from a previous crash (id='0').
     2. Block for new, undelivered messages (id='>').
+
+    If the stream or group does not exist yet (startup race condition), auto-creates
+    the groups and returns an empty list so the caller retries on the next tick.
     """
     redis = get_redis_client()
 
-    # Step 1: recover any pending (unacknowledged) messages from a crash
-    pending = redis.xreadgroup(
-        groupname=group,
-        consumername=consumer,
-        streams={stream: '0'},
-        count=count,
-    )
-    if pending:
-        _, messages = pending[0]
-        if messages:
-            return [(msg_id, msg_data) for msg_id, msg_data in messages]
+    try:
+        # Step 1: recover any pending (unacknowledged) messages from a crash
+        pending = redis.xreadgroup(
+            groupname=group,
+            consumername=consumer,
+            streams={stream: '0'},
+            count=count,
+        )
+        if pending:
+            _, messages = pending[0]
+            if messages:
+                return [(msg_id, msg_data) for msg_id, msg_data in messages]
 
-    # Step 2: block for new messages
-    new = redis.xreadgroup(
-        groupname=group,
-        consumername=consumer,
-        streams={stream: '>'},
-        count=count,
-        block=block_ms,
-    )
-    if not new:
-        return []
+        # Step 2: block for new messages
+        new = redis.xreadgroup(
+            groupname=group,
+            consumername=consumer,
+            streams={stream: '>'},
+            count=count,
+            block=block_ms,
+        )
+        if not new:
+            return []
 
-    _, messages = new[0]
-    return [(msg_id, msg_data) for msg_id, msg_data in messages]
+        _, messages = new[0]
+        return [(msg_id, msg_data) for msg_id, msg_data in messages]
+
+    except Exception as e:
+        err = str(e)
+        if 'NOGROUP' in err.upper() or 'no such key' in err.lower():
+            # Stream or group missing — happens when workers start before the first ingest.
+            # Auto-create and return empty; next iteration will pick up messages normally.
+            initialize_streams()
+            return []
+        raise
 
 
 def ack_message(stream: str, group: str, message_id: str) -> None:

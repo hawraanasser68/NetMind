@@ -1,4 +1,5 @@
 import hashlib
+import random
 import sys
 import pandas as pd
 import structlog
@@ -14,6 +15,45 @@ logger = structlog.get_logger(__name__)
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Strip whitespace from column names — CICIDS2018 has inconsistent spacing."""
     df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+_MAX_DURATION_SECONDS = 7 * 24 * 3600   # 7 days — any longer is a sensor/CSV artifact
+
+
+def _drop_artifacts(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove structurally impossible rows that cannot represent real network traffic.
+
+    Two patterns identified in CICIDS2018 Kaggle exports:
+      1. Duration > 7 days — physically impossible for a single flow record.
+      2. Protocol=0 AND Dst Port=0 AND total bytes=0 — zero-payload raw-IP
+         placeholder rows (often cause the agent to escalate pointlessly).
+    """
+    before = len(df)
+    mask   = pd.Series(True, index=df.index)
+
+    dur_col = next((c for c in df.columns if 'duration' in c.lower()), None)
+    if dur_col:
+        mask &= df[dur_col] <= _MAX_DURATION_SECONDS
+
+    proto_col = next((c for c in df.columns if c.lower() == 'protocol'), None)
+    port_col  = next((c for c in df.columns if 'dst port' in c.lower() or c.lower() == 'destination port'), None)
+    fwd_col   = next((c for c in df.columns if 'tot fwd pkts' in c.lower() or 'total fwd packets' in c.lower()), None)
+    bwd_col   = next((c for c in df.columns if 'tot bwd pkts' in c.lower() or 'total backward packets' in c.lower()), None)
+
+    if proto_col and port_col and fwd_col and bwd_col:
+        zero_payload = (
+            (df[proto_col].fillna(0).astype(float) == 0) &
+            (df[port_col].fillna(0).astype(float)  == 0) &
+            (df[fwd_col].fillna(0).astype(float)   == 0) &
+            (df[bwd_col].fillna(0).astype(float)   == 0)
+        )
+        mask &= ~zero_payload
+
+    df      = df[mask].copy()
+    dropped = before - len(df)
+    if dropped:
+        logger.info('Dropped artifact rows', count=dropped, reasons='impossible_duration_or_zero_payload')
     return df
 
 
@@ -63,9 +103,21 @@ def normalize_flow(row: dict) -> dict:
     Envelope shape:
       flow_id, machine_ip, captured_at, label, dst_port, protocol, features (33 floats)
     """
-    # CICIDS2018 uses 'Src IP' in most versions; fall back for variations
-    machine_ip  = str(row.get('Src IP') or row.get('Source IP') or '0.0.0.0').strip()
-    captured_at = _parse_timestamp(row.get('Timestamp') or row.get('timestamp') or '')
+    # CICIDS2018 from this Kaggle source strips IPs; generate realistic synthetic ones.
+    # Benign traffic → internal RFC1918 subnets; attack traffic → routable external IPs.
+    raw_ip = str(row.get('Src IP') or row.get('Source IP') or '').strip()
+    if not raw_ip or raw_ip == '0.0.0.0':
+        label_str = str(row.get('Label') or row.get('label') or '').strip().lower()
+        if 'benign' in label_str:
+            # Small pool (150 IPs) so each machine accumulates enough flows to
+            # exceed the 10-flow graduation threshold with a 50k-row ingest.
+            machine_ip = f'192.168.{random.randint(1,3)}.{random.randint(1,50)}'
+        else:
+            machine_ip = f'{random.choice([45,52,80,104,138,185])}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}'
+    else:
+        machine_ip = raw_ip
+    # Use ingestion time so dashboard 24h windows work correctly
+    captured_at = datetime.now(timezone.utc).isoformat()
 
     features = extract_features(row)
     flow_id  = _make_flow_id(machine_ip, captured_at, features[0])
@@ -84,16 +136,17 @@ def normalize_flow(row: dict) -> dict:
     }
 
 
-def ingest_cicids_csv(csv_path: str, batch_size: int = 500) -> int:
+def ingest_cicids_csv(csv_path: str, batch_size: int = 500, max_rows: int | None = None) -> int:
     """
     Read a CICIDS2018 CSV, clean it, and publish each row to the network-flows stream.
     Returns the number of flows successfully published.
     """
-    logger.info('Starting CICIDS2018 ingest', path=csv_path)
+    logger.info('Starting CICIDS2018 ingest', path=csv_path, max_rows=max_rows)
 
-    df = pd.read_csv(csv_path, low_memory=False)
+    df = pd.read_csv(csv_path, low_memory=False, nrows=max_rows)
     df = _normalize_columns(df)
     df = _clean_dataframe(df)
+    df = _drop_artifacts(df)
 
     published = 0
     errors    = 0
@@ -115,6 +168,7 @@ def ingest_cicids_csv(csv_path: str, batch_size: int = 500) -> int:
 
 
 if __name__ == '__main__':
+    import argparse
     from src.infra.infra_vault import load_secrets
     from src.infra.infra_logging import configure_logging
 
@@ -122,5 +176,8 @@ if __name__ == '__main__':
     load_secrets()
     initialize_streams()
 
-    path = sys.argv[1] if len(sys.argv) > 1 else 'data/cicids2018.csv'
-    ingest_cicids_csv(path)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('csv_path')
+    parser.add_argument('--rows', '--limit', dest='rows', type=int, default=None)
+    args = parser.parse_args()
+    ingest_cicids_csv(args.csv_path, max_rows=args.rows)

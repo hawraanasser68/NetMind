@@ -1,4 +1,5 @@
 import json
+import time
 import structlog
 
 from src.data.data_consumer import (
@@ -49,6 +50,7 @@ def run_profiler_worker(consumer_name: str = _CONSUMER) -> None:
 
         except Exception:
             logger.exception('Profiler worker outer loop error')
+            time.sleep(2)
 
 
 if __name__ == '__main__':

@@ -26,12 +26,12 @@ def upgrade() -> None:
     conn = op.get_bind()
     for username, env_var in _USERS:
         password = os.environ[env_var]
-        # CREATE USER only if the role does not already exist (idempotent)
-        #DO $$ ... IF NOT EXISTS block makes it idempotent — if the user already exists (e.g. someone re-ran migrations), it skips silently instead of crashing
         conn.execute(sa.text(
             f"DO $$ BEGIN "
             f"  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{username}') THEN "
             f"    CREATE USER {username} WITH PASSWORD :pw; "
+            f"  ELSE "
+            f"    ALTER USER {username} WITH PASSWORD :pw; "
             f"  END IF; "
             f"END $$"
         ), {'pw': password})

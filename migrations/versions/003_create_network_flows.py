@@ -73,8 +73,8 @@ def upgrade() -> None:
     op.execute('CREATE INDEX IF NOT EXISTS idx_nf_captured_at  ON network_flows (captured_at)')
     op.execute('CREATE INDEX IF NOT EXISTS idx_nf_risk_level   ON network_flows (risk_level)')
 
-    # Per-user grants
-    op.execute('GRANT INSERT          ON network_flows TO logger_user')
+    # Per-user grants — logger needs SELECT for ON CONFLICT uniqueness check in PG16
+    op.execute('GRANT INSERT, SELECT  ON network_flows TO logger_user')
     op.execute('GRANT SELECT          ON network_flows TO profiler_user')
     op.execute('GRANT SELECT          ON network_flows TO agent_user')
     op.execute('GRANT SELECT          ON network_flows TO dashboard_user')

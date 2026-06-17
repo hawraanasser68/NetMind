@@ -1,7 +1,11 @@
 import ipaddress
 import json
+from typing import TYPE_CHECKING
+
 import structlog
-from sentence_transformers import SentenceTransformer
+
+if TYPE_CHECKING:
+    from fastembed import TextEmbedding
 
 from src.infra.infra_db import get_db_session
 from src.infra.infra_redis import get_redis_client
@@ -16,13 +20,14 @@ PROFILE_CACHE_TTL    = 3600   # Redis TTL in seconds
 
 _CACHE_KEY_PREFIX = 'profile:'
 
-_embedder: SentenceTransformer | None = None
+_embedder: "TextEmbedding | None" = None
 
 
-def _get_embedder() -> SentenceTransformer:
+def _get_embedder() -> "TextEmbedding":
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
     return _embedder
 
 
@@ -140,7 +145,7 @@ def maybe_generate_snapshot(machine_ip: str, profile: dict) -> None:
         f"known protocols={profile['known_protocols']}."
     )
 
-    embedding = _get_embedder().encode(summary).tolist()
+    embedding = list(_get_embedder().embed([summary]))[0].tolist()
 
     conn = get_db_session()
     with conn.cursor() as cur:
@@ -162,6 +167,11 @@ def maybe_generate_snapshot(machine_ip: str, profile: dict) -> None:
 
     conn.commit()
     logger.info('Machine history snapshot saved', machine_ip=machine_ip, flows=profile['flow_count'])
+
+
+def get_machine_profile(machine_ip: str) -> dict:
+    """Read-only profile fetch for the classifier worker. Never writes."""
+    return _get_or_load_profile(machine_ip)
 
 
 def update_machine_profile(flow: dict) -> dict:

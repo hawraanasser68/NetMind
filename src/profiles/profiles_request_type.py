@@ -118,6 +118,11 @@ def _upsert_db(profile: dict) -> None:
     conn.commit()
 
 
+def get_request_type_profile(machine_ip: str, dst_port: int) -> dict:
+    """Read-only profile fetch for the classifier worker. Never writes."""
+    return _get_or_load_profile(machine_ip, _request_type_for_port(dst_port))
+
+
 def update_request_type_profile(flow: dict) -> dict:
     """
     Update the per-(machine, request_type) profile for one flow.
