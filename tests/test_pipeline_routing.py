@@ -88,6 +88,8 @@ def test_high_risk_flow_published_to_stream():
         'probabilities': {'benign': 0.05, 'suspicious': 0.05, 'attack': 0.90},
     }
     with patch('src.data.data_classifier_worker._call_classifier', return_value=high_result), \
+         patch('src.data.data_classifier_worker.get_machine_profile', return_value=None), \
+         patch('src.data.data_classifier_worker.get_request_type_profile', return_value=None), \
          patch('src.data.data_classifier_worker.publish_high_risk') as mock_pub:
         from src.data.data_classifier_worker import classify_and_route
         classify_and_route(_FLOW)
@@ -103,6 +105,8 @@ def test_any_flow_escalates_without_profile():
         'probabilities': {'benign': 0.95, 'suspicious': 0.03, 'attack': 0.02},
     }
     with patch('src.data.data_classifier_worker._call_classifier', return_value=low_result), \
+         patch('src.data.data_classifier_worker.get_machine_profile', return_value=None), \
+         patch('src.data.data_classifier_worker.get_request_type_profile', return_value=None), \
          patch('src.data.data_classifier_worker.publish_high_risk') as mock_pub:
         from src.data.data_classifier_worker import classify_and_route
         classify_and_route(_FLOW)
@@ -116,6 +120,8 @@ def test_published_message_includes_scoring_fields():
         'probabilities': {'benign': 0.05, 'suspicious': 0.05, 'attack': 0.90},
     }
     with patch('src.data.data_classifier_worker._call_classifier', return_value=high_result), \
+         patch('src.data.data_classifier_worker.get_machine_profile', return_value=None), \
+         patch('src.data.data_classifier_worker.get_request_type_profile', return_value=None), \
          patch('src.data.data_classifier_worker.publish_high_risk') as mock_pub:
         from src.data.data_classifier_worker import classify_and_route
         classify_and_route(_FLOW)

@@ -39,7 +39,11 @@ _OSINT_TOOLS = {
 }
 
 _BENIGN_PHRASES = [
-    'no action needed', 'benign', 'safe traffic', 'normal behavior',
+    'this flow is benign', 'traffic is benign', 'flow is safe',
+    'no threat detected', 'not a threat', 'safe traffic',
+    'no malicious activity', 'false positive', 'no action required',
+    'is benign', 'benign traffic', 'appears benign', 'looks benign',
+    'no action needed', 'no action necessary',
 ]
 
 
