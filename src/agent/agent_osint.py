@@ -155,7 +155,7 @@ def _whois(domain: str) -> dict:
     import whois  # python-whois library
     from datetime import datetime
 
-    w             = whois.whois(domain)
+    w = whois.whois(domain)
     creation_date = w.creation_date
     if isinstance(creation_date, list):
         creation_date = creation_date[0]

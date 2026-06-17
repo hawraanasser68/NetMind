@@ -13,6 +13,8 @@ pandas==2.2.3
 psycopg2-binary==2.9.9
 pgvector==0.3.2
 alembic==1.13.3
+sqlalchemy==2.0.36
+tzdata==2025.2
 
 # Redis
 redis==5.1.0
@@ -25,9 +27,10 @@ structlog==24.4.0
 
 # LLM agent
 anthropic==0.40.0
+openai==1.57.0
 
-# Embeddings (pgvector RAG)
-sentence-transformers==3.2.1
+# Embeddings (pgvector RAG) — fastembed uses ONNX, no torch/CUDA dependency
+fastembed==0.4.2
 
 # Dashboard
 streamlit==1.39.0

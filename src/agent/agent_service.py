@@ -3,10 +3,13 @@ import json
 import time
 from datetime import datetime, timezone
 
-import anthropic
+from typing import TYPE_CHECKING
+
 import requests
 import structlog
-from sentence_transformers import SentenceTransformer
+
+if TYPE_CHECKING:
+    from fastembed import TextEmbedding
 
 from src.agent.agent_osint import call_osint_tool
 from src.agent.agent_prompts import (
@@ -18,6 +21,11 @@ from src.agent.agent_prompts import (
 from src.agent.agent_tools import TOOLS
 from src.infra.infra_redaction import redact
 from src.infra.infra_vault import get_secret
+from src.llm.llm_client import (
+    AnthropicLLM, GroqLLM, GeminiLLM,
+    get_anthropic_llm, get_groq_llm, get_gemini_llm,
+    is_credits_error, is_groq_rate_limit,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -25,28 +33,21 @@ _GUARDRAILS_URL     = 'http://guardrails:8004/guardrails'
 _GUARDRAILS_TIMEOUT = 5  # seconds — fail open if sidecar is unavailable
 
 MAX_TOOL_CALLS = 5
-MAX_TOKENS     = 1000
-MAX_SECONDS    = 30
+MAX_TOKENS     = 1500
+MAX_SECONDS    = 90
 
 OSINT_TOOLS    = {'lookup_ip_vt', 'lookup_ip_abuse', 'lookup_threats', 'whois_domain', 'lookup_ports'}
 INTERNAL_TOOLS = {'rag_search', 'generate_rule', 'escalate'}
 
-_embedder:       SentenceTransformer | None = None
-_anthropic_client: anthropic.Anthropic | None = None
+_embedder: "TextEmbedding | None" = None
 
 
-def _get_embedder() -> SentenceTransformer:
+def _get_embedder() -> "TextEmbedding":
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
     return _embedder
-
-
-def _get_anthropic_client() -> anthropic.Anthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        _anthropic_client = anthropic.Anthropic(api_key=get_secret('claude_api_key'))
-    return _anthropic_client
 
 
 def _guardrails_headers() -> dict:
@@ -120,7 +121,7 @@ def update_session(session: dict, finding: dict, redis) -> None:
 
 def retrieve_machine_history(machine_ip: str, db) -> str:
     """RAG: embed a query and retrieve the 3 most similar snapshots via pgvector cosine search."""
-    query_vector = _get_embedder().encode(f'Machine {machine_ip} behavioral history').tolist()
+    query_vector = list(_get_embedder().embed([f'Machine {machine_ip} behavioral history']))[0].tolist()
 
     with db.cursor() as cur:
         cur.execute("""
@@ -168,16 +169,43 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
     Main agent loop. Loads session, retrieves RAG history, calls tools, returns finding.
     Budget: MAX_TOOL_CALLS calls or MAX_SECONDS, whichever hits first.
     """
-    client = _get_anthropic_client()
+    llm    = get_anthropic_llm()
     budget = AgentBudget()
 
-    machine_ip = flow.get('machine_ip', 'unknown')
+    machine_ip  = flow.get('machine_ip', 'unknown')
+    trace_steps = []
+
+    # Synthetic classify step — scoring already ran in the classifier worker
+    trace_steps.append({
+        'step_type':        'classify',
+        'tool_name':        None,
+        'tool_args':        None,
+        'result_summary':   (
+            f"Score {scoring_result.get('classifier_score', 0):.3f} · "
+            f"Risk {scoring_result.get('risk_level', '?')} · "
+            f"Deviation {scoring_result.get('risk_score', 0):.3f}"
+        ),
+        'duration_ms':      None,
+        'guardrail_status': None,
+        'metadata':         {k: v for k, v in scoring_result.items() if not isinstance(v, (list, dict))},
+    })
 
     # Point 1 — check all flow field values for injection before agent sees them
+    _t = time.time()
     input_check = _guardrails_post('check_input', {
         'flow_id':     flow.get('flow_id', ''),
         'flow_fields': {k: v for k, v in flow.items() if k != 'features'},
     })
+    trace_steps.append({
+        'step_type':        'input_check',
+        'tool_name':        None,
+        'tool_args':        None,
+        'result_summary':   input_check.get('reason') or ('Approved' if input_check.get('approved', True) else 'Rejected'),
+        'duration_ms':      int((time.time() - _t) * 1000),
+        'guardrail_status': 'approved' if input_check.get('approved', True) else 'rejected',
+        'metadata':         {},
+    })
+
     if not input_check.get('approved', True):
         logger.warning('Guardrails rejected flow input', reason=input_check.get('reason'), machine_ip=machine_ip)
         return {
@@ -194,6 +222,7 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             'limit_hit':          False,
             'limit_reason':       None,
             'confidence':         'LOW',
+            'trace_steps':        trace_steps,
         }
 
     session = get_session_context(machine_ip, redis)
@@ -244,32 +273,56 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             limit_reason = str(e)
             messages.append({'role': 'user', 'content': LIMIT_HIT_PROMPT.format(reason=str(e))})
 
-        response = client.messages.create(
-            model      = 'claude-3-5-sonnet-20241022',
-            max_tokens = MAX_TOKENS,
-            system     = SYSTEM_PROMPT,
-            tools      = TOOLS if not limit_hit else [],
-            messages   = messages,
-        )
+        try:
+            response = llm.chat(
+                system     = SYSTEM_PROMPT,
+                messages   = messages,
+                tools      = TOOLS if not limit_hit else [],
+                max_tokens = MAX_TOKENS,
+            )
+        except Exception as exc:
+            no_assistant_yet = not any(m.get('role') == 'assistant' for m in messages)
+            if is_credits_error(exc) and no_assistant_yet:
+                logger.warning('Anthropic credits exhausted — switching to Groq fallback',
+                               flow_id=flow.get('flow_id'))
+                llm = get_groq_llm()
+                try:
+                    response = llm.chat(
+                        system     = SYSTEM_PROMPT,
+                        messages   = messages,
+                        tools      = TOOLS if not limit_hit else [],
+                        max_tokens = MAX_TOKENS,
+                    )
+                except Exception as groq_exc:
+                    if is_groq_rate_limit(groq_exc):
+                        logger.warning('Groq rate limit hit — switching to Gemini fallback',
+                                       flow_id=flow.get('flow_id'))
+                        llm      = get_gemini_llm()
+                        response = llm.chat(
+                            system     = SYSTEM_PROMPT,
+                            messages   = messages,
+                            tools      = TOOLS if not limit_hit else [],
+                            max_tokens = MAX_TOKENS,
+                        )
+                    else:
+                        raise
+            else:
+                raise
 
-        messages.append({'role': 'assistant', 'content': response.content})
+        llm.append_assistant(messages, response)
 
         if response.stop_reason == 'end_turn' or limit_hit:
-            for block in response.content:
-                if hasattr(block, 'text'):
-                    explanation = redact(block.text)
+            explanation = redact(response.text)
             break
 
         if response.stop_reason != 'tool_use':
             break
 
         tool_results = []
-        for block in response.content:
-            if block.type != 'tool_use':
-                continue
-
-            tool_name = block.name
-            tool_args = block.input
+        injection_detected = False
+        for tc in response.tool_calls:
+            tool_name = tc.name
+            tool_args = tc.args
 
             # Point 2 — validate tool call via guardrails sidecar
             tool_check = _guardrails_post('check_tool_call', {
@@ -279,15 +332,24 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
                 'flow':      flow,
             })
             if not tool_check.get('approved', True):
+                trace_steps.append({
+                    'step_type':        'tool_call',
+                    'tool_name':        tool_name,
+                    'tool_args':        {k: redact(str(v)) for k, v in tool_args.items()},
+                    'result_summary':   f"Blocked by guardrail: {tool_check.get('reason', '')}",
+                    'duration_ms':      0,
+                    'guardrail_status': 'rejected',
+                    'metadata':         {},
+                })
                 tool_results.append({
-                    'type':        'tool_result',
-                    'tool_use_id': block.id,
-                    'content':     f"Tool call rejected: {tool_check.get('reason')}",
+                    'tool_call_id': tc.id,
+                    'content':      f"Tool call rejected: {tool_check.get('reason')}",
                 })
                 continue
 
             budget.consume()
             tools_called.append(tool_name)
+            _tool_t = time.time()
 
             if tool_name == 'rag_search':
                 result = retrieve_machine_history(tool_args['machine_ip'], db)
@@ -308,6 +370,8 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             else:
                 result = f'Unknown tool: {tool_name}'
 
+            _tool_dur = int((time.time() - _tool_t) * 1000)
+
             # Point 3 — sanitize tool result via guardrails sidecar
             result_check = _guardrails_post('check_tool_result', {
                 'flow_id':     flow.get('flow_id', ''),
@@ -316,15 +380,26 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             })
             result = result_check.get('sanitized_result', str(result))
             if result_check.get('was_modified'):
-                messages.append({'role': 'user', 'content': INJECTION_DETECTED_PROMPT})
+                injection_detected = True
 
-            tool_results.append({
-                'type':        'tool_result',
-                'tool_use_id': block.id,
-                'content':     redact(result),
+            trace_steps.append({
+                'step_type':        'tool_call',
+                'tool_name':        tool_name,
+                'tool_args':        {k: redact(str(v)) for k, v in tool_args.items()},
+                'result_summary':   redact(str(result))[:500],
+                'duration_ms':      _tool_dur,
+                'guardrail_status': 'modified' if result_check.get('was_modified') else 'approved',
+                'metadata':         {},
             })
 
-        messages.append({'role': 'user', 'content': tool_results})
+            tool_results.append({
+                'tool_call_id': tc.id,
+                'content':      redact(result),
+            })
+
+        llm.append_tool_results(messages, tool_results)
+        if injection_detected:
+            messages.append({'role': 'user', 'content': INJECTION_DETECTED_PROMPT})
 
     finding = {
         'flow_id':            flow.get('flow_id', ''),
@@ -343,6 +418,7 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
     }
 
     # Point 4 — validate finding consistency before writing to security_alerts
+    _t = time.time()
     finding_check = _guardrails_post('check_finding', {
         'flow_id':          finding['flow_id'],
         'risk_level':       finding['risk_level'],
@@ -350,6 +426,15 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
         'explanation':      finding['explanation'],
         'firewall_rule':    finding['firewall_rule'],
         'limit_hit':        finding['limit_hit'],
+    })
+    trace_steps.append({
+        'step_type':        'finding_check',
+        'tool_name':        None,
+        'tool_args':        None,
+        'result_summary':   finding_check.get('reason') or ('Approved' if finding_check.get('approved', True) else 'Modified'),
+        'duration_ms':      int((time.time() - _t) * 1000),
+        'guardrail_status': 'approved' if finding_check.get('approved', True) else 'modified',
+        'metadata':         {},
     })
     if not finding_check.get('approved', True):
         logger.warning('Guardrails rejected finding', reason=finding_check.get('reason'), flow_id=finding['flow_id'])
@@ -360,5 +445,6 @@ def process_flow(scoring_result: dict, flow: dict, redis, db) -> dict:
             f"[Finding modified by guardrail: {finding_check.get('reason')}]"
         )
 
+    finding['trace_steps'] = trace_steps
     update_session(session, finding, redis)
     return finding

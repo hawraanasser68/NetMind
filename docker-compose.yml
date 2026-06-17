@@ -80,6 +80,8 @@ services:
         vault kv put secret/soc-agent/dashboard_db_password  value="$$DASHBOARD_DB_PASSWORD"
         [ -n "$$GREYNOISE_API_KEY" ] && vault kv put secret/soc-agent/greynoise_api_key value="$$GREYNOISE_API_KEY" || true
         [ -n "$$SHODAN_API_KEY" ]    && vault kv put secret/soc-agent/shodan_api_key    value="$$SHODAN_API_KEY"    || true
+        [ -n "$$GROQ_API_KEY" ]      && vault kv put secret/soc-agent/groq_api_key      value="$$GROQ_API_KEY"      || true
+        [ -n "$$GEMINI_API_KEY" ]    && vault kv put secret/soc-agent/gemini_api_key    value="$$GEMINI_API_KEY"    || true
     environment:
       VAULT_ADDR:               http://vault:8200
       VAULT_TOKEN:              ${VAULT_TOKEN}
@@ -97,6 +99,8 @@ services:
       DASHBOARD_DB_PASSWORD:    ${DASHBOARD_DB_PASSWORD}
       GREYNOISE_API_KEY:        ${GREYNOISE_API_KEY:-}
       SHODAN_API_KEY:           ${SHODAN_API_KEY:-}
+      GROQ_API_KEY:             ${GROQ_API_KEY:-}
+      GEMINI_API_KEY:           ${GEMINI_API_KEY:-}
     depends_on:
       vault:
         condition: service_healthy
@@ -161,12 +165,13 @@ services:
     restart: unless-stopped
     command: python -m src.data.data_logger_worker
     environment:
-      VAULT_ADDR:   http://vault:8200
-      VAULT_TOKEN:  ${VAULT_TOKEN}
-      DB_HOST:      postgres
-      DB_PORT:      5432
-      DB_NAME:      socdb
-      DB_USER:      logger_user
+      VAULT_ADDR:          http://vault:8200
+      VAULT_TOKEN:         ${VAULT_TOKEN}
+      DB_HOST:             postgres
+      DB_PORT:             5432
+      DB_NAME:             socdb
+      DB_USER:             logger_user
+      DB_PASSWORD_SECRET:  logger_db_password
     depends_on:
       redis:
         condition: service_healthy
@@ -233,12 +238,15 @@ services:
     restart: unless-stopped
     command: python -m uvicorn src.agent.agent_main:app --host 0.0.0.0 --port 8003
     environment:
-      VAULT_ADDR:   http://vault:8200
-      VAULT_TOKEN:  ${VAULT_TOKEN}
-      DB_HOST:      postgres
-      DB_PORT:      5432
-      DB_NAME:      socdb
-      DB_USER:      agent_user
+      VAULT_ADDR:          http://vault:8200
+      VAULT_TOKEN:         ${VAULT_TOKEN}
+      GROQ_API_KEY:        ${GROQ_API_KEY:-}
+      GEMINI_API_KEY:      ${GEMINI_API_KEY:-}
+      DB_HOST:             postgres
+      DB_PORT:             5432
+      DB_NAME:             socdb
+      DB_USER:             agent_user
+      DB_PASSWORD_SECRET:  agent_db_password
     ports:
       - "8003:8003"
     healthcheck:
@@ -267,12 +275,15 @@ services:
     deploy:
       replicas: 3
     environment:
-      VAULT_ADDR:   http://vault:8200
-      VAULT_TOKEN:  ${VAULT_TOKEN}
-      DB_HOST:      postgres
-      DB_PORT:      5432
-      DB_NAME:      socdb
-      DB_USER:      agent_user
+      VAULT_ADDR:          http://vault:8200
+      VAULT_TOKEN:         ${VAULT_TOKEN}
+      GROQ_API_KEY:        ${GROQ_API_KEY:-}
+      GEMINI_API_KEY:      ${GEMINI_API_KEY:-}
+      DB_HOST:             postgres
+      DB_PORT:             5432
+      DB_NAME:             socdb
+      DB_USER:             agent_user
+      DB_PASSWORD_SECRET:  agent_db_password
     depends_on:
       redis:
         condition: service_healthy
@@ -287,6 +298,39 @@ services:
     networks:
       - soc_net
 
+  # ── Streamlit dashboard (Phase 9) ────────────────────────────────────────
+  dashboard:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: streamlit run src/dashboard/dashboard_main.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      VAULT_ADDR:          http://vault:8200
+      VAULT_TOKEN:         ${VAULT_TOKEN}
+      DB_HOST:             postgres
+      DB_PORT:             5432
+      DB_NAME:             socdb
+      DB_USER:             dashboard_user
+      DB_PASSWORD_SECRET:  dashboard_db_password
+    ports:
+      - "8501:8501"
+    healthcheck:
+      test:         ["CMD-SHELL", "curl -sf http://localhost:8501/_stcore/health"]
+      interval:     15s
+      timeout:      5s
+      retries:      5
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+    networks:
+      - soc_net
+
   # ── Profiler worker (Phase 6) ─────────────────────────────────────────────
   profiler:
     build:
@@ -295,12 +339,13 @@ services:
     restart: unless-stopped
     command: python -m src.data.data_profiler_worker
     environment:
-      VAULT_ADDR:   http://vault:8200
-      VAULT_TOKEN:  ${VAULT_TOKEN}
-      DB_HOST:      postgres
-      DB_PORT:      5432
-      DB_NAME:      socdb
-      DB_USER:      profiler_user
+      VAULT_ADDR:          http://vault:8200
+      VAULT_TOKEN:         ${VAULT_TOKEN}
+      DB_HOST:             postgres
+      DB_PORT:             5432
+      DB_NAME:             socdb
+      DB_USER:             profiler_user
+      DB_PASSWORD_SECRET:  profiler_db_password
     depends_on:
       redis:
         condition: service_healthy

@@ -34,7 +34,7 @@ def _get_vault_client() -> hvac.Client:
     return _vault_client
 
 
-def get_secret(secret_name: str) -> str:
+def get_secret(secret_name: str, env_fallback: str | None = None) -> str:
     if secret_name in _secrets_cache:
         return _secrets_cache[secret_name]
 
@@ -49,6 +49,10 @@ def get_secret(secret_name: str) -> str:
         _secrets_cache[secret_name] = value
         return value
     except Exception as e:
+        if env_fallback and (env_val := os.environ.get(env_fallback)):
+            logger.info(f"Secret '{secret_name}' loaded from env var '{env_fallback}'")
+            _secrets_cache[secret_name] = env_val
+            return env_val
         raise RuntimeError(
             f"Failed to load secret '{secret_name}' from Vault. "
             f'The application cannot start safely.'
