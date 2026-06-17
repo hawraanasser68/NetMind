@@ -4,6 +4,24 @@ import pandas as pd
 import kagglehub
 import os
 
+
+import os
+import kagglehub
+
+path = kagglehub.dataset_download("solarmainframe/ids-intrusion-csv")
+print("Dataset path:", path)
+print("\nAll files:")
+for f in sorted(os.listdir(path)):
+    size = os.path.getsize(os.path.join(path, f)) / 1024 / 1024
+    print(f"  {f}  ({size:.1f} MB)")
+
+for filename in ['02-20-2018.csv', '02-21-2018.csv', '03-02-2018.csv']:
+    df_temp = pd.read_csv(os.path.join(path, filename), 
+                          low_memory=False, nrows=1000)
+    print(f"\n{filename}:")
+    print(df_temp['Label'].value_counts())
+    
+        
 # Download latest version
 path = kagglehub.dataset_download("solarmainframe/ids-intrusion-csv")
 df = pd.read_csv(os.path.join(path, "02-14-2018.csv"), low_memory=False)

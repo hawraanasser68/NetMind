@@ -35,26 +35,49 @@ Derived:      byte_ratio, proto_tcp, proto_udp, proto_icmp, is_privileged_port
 ## Decision 2 — Label Schema and Train/Test Split
 
 **Label mapping**:
+
+The dataset uses different label strings from the original spec. LABEL_MAP covers both
+variants so the contract works regardless of which dataset version is used.
 ```
 Benign (0):      Benign
 Suspicious (1):  Infilteration
-Attack (2):      FTP-BruteForce, SSH-Bruteforce, BruteForce-Web,
-                 BruteForce-XSS, SQL-Injection, DoS-Slowloris,
-                 DoS-Slowhttptest, DoS-Hulk, DoS-GoldenEye,
-                 DDoS-HOIC, DDoS-LOIC-UDP, DDoS-LOIC-HTTP,
+Attack (2):      FTP-BruteForce, SSH-Bruteforce,
+                 Brute Force -Web, BruteForce-Web,
+                 Brute Force -XSS, BruteForce-XSS,
+                 SQL Injection, SQL-Injection,
+                 DoS attacks-GoldenEye, DoS-GoldenEye,
+                 DoS attacks-SlowHTTPTest, DoS-Slowhttptest,
+                 DoS attacks-Hulk, DoS-Hulk,
+                 DoS attacks-Slowloris, DoS-Slowloris,
+                 DDoS attacks-LOIC-HTTP, DDoS-LOIC-HTTP,
+                 DDOS attack-LOIC-UDP, DDoS-LOIC-UDP,
+                 DDOS attack-HOIC, DDoS-HOIC,
                  Bot, Heartbleed
 ```
 
-**Train/test split**:
+**Files used**:
 ```
-Train: Feb 14, 15, 16, 22, 23
-Test:  Feb 28 + Mar 01 (strictly more recent, never seen during training)
+All 10 files loaded together (02-14 through 03-02).
+Infilteration (suspicious) only appears in 02-28 and 03-01.
 ```
 
-**Cross-validation**: TimeSeriesSplit — validation window always moves forward in time. Never validate on data older than training data.
+**Train/test split**: stratified 80/20 split (sklearn train_test_split, stratify=y).
 
-**Rationale**: Infiltration mapped to Suspicious because it is designed to look normal — the classifier should be uncertain about it. That uncertainty triggers the behavioral baseline. Temporal split reflects real-world validation conditions.
+A temporal file-level split is incompatible with the suspicious class — Infilteration
+only exists in 02-28 and 03-01, so any file-level split puts it entirely in training
+with zero suspicious samples in test, making suspicious_f1 impossible to evaluate.
+Stratified split guarantees all three classes appear in both sets proportionally.
 
+**Class balancing**: after label mapping, sample equal rows per class before splitting.
+Suspicious is the rarest class (~27k rows). Sample that many from benign and attack too.
+This gives the model clean equal signal for all three classes without class_weight tricks.
+
+**Cross-validation**: TimeSeriesSplit(n_splits=5) on the training split.
+
+**Rationale**: Infiltration mapped to Suspicious because it is designed to look normal —
+the classifier should be uncertain about it. That uncertainty triggers the behavioral
+baseline. Balanced sampling chosen over class_weight because it gives the model
+genuinely equal exposure to each class rather than reweighting a skewed dataset.
 ---
 
 ## Decision 3 — Behavioral Profile Schema
@@ -368,16 +391,20 @@ New machine buffer:   3600s (1 hour)
 ## Decision 12 — Embedding Model
 
 ```
-Model:      sentence-transformers all-MiniLM-L6-v2
+Library:    fastembed 0.4.2 (ONNX runtime — no torch, no CUDA)
+Model:      sentence-transformers/all-MiniLM-L6-v2
 Dimensions: 384
 Cost:       free, runs locally
-Hosting:    inside profiler container, no external API call
+Hosting:    inside profiler and agent containers, no external API call
 Mode:       synchronous
+Download:   ~23MB ONNX model (baked into Docker image at build time)
 ```
+
+**Replaced**: `sentence-transformers==3.2.1` which pulled in `torch` + NVIDIA CUDA packages (~500MB), causing Docker build timeouts on Mac due to download size.
 
 **Production path**: upgrade to OpenAI text-embedding-3-small (1,536 dimensions).
 
-**Rationale**: Free, local, no API dependency, sufficient quality for short machine behavioral summaries.
+**Rationale**: fastembed runs the same all-MiniLM-L6-v2 model via ONNX runtime, producing identical 384-dimension embeddings, with no PyTorch dependency. Docker image build time reduced significantly. CPU inference performance is equivalent for short text inputs.
 
 ---
 
@@ -618,3 +645,19 @@ migrate runs alembic upgrade head then exits before other services start.
 **MLflow**: skipped for demo. Training metrics logged to metrics.json. SHA-256 validated via model_card.json. MLflow and drift detection documented as production enhancements.
 
 **File naming**: every file prefixed with its module name. All file names unique across entire codebase.
+
+---
+
+## Decision 21 — Dashboard Brand & Flow Trace
+
+**Brand**: NetMind "AI Powered SOC Agent". Dashboard matches logo identity:
+- Background `#0A0B14`, cards `#0F1120`, border `#1E2235`
+- Gradient `#00C2FF` (cyan) → `#2563EB` (blue) → `#7C3AED` (purple)
+- Streamlit theme via `.streamlit/config.toml`
+
+**Flow Trace**: Every agent investigation records a per-step timeline in `flow_traces`:
+- Stored: step_type, tool_name, tool_args (redacted), result_summary (≤500 chars), duration_ms, guardrail_status
+- Step types: `classify` (ML scores), `input_check`, `tool_call`, `finding_check`
+- Written by `data_agent_worker._insert_trace_steps()` after the alert INSERT (same transaction boundary)
+- Visible in dashboard as a vertical HTML timeline inside each alert expander
+- Grants: `agent_user` INSERT, `dashboard_user` SELECT

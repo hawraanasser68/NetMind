@@ -158,21 +158,7 @@ TOOLS = [
             "required": ["ip_address"]
         }
     },
-    {
-        "name": "check_scanner",
-        "description": (
-            "Check via GreyNoise whether this IP is a mass internet scanner "
-            "(background noise) vs a targeted attacker. "
-            "Call when intent is unclear."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "ip_address": {"type": "string"}
-            },
-            "required": ["ip_address"]
-        }
-    },
+   
     {
         "name": "whois_domain",
         "description": (
@@ -275,7 +261,6 @@ OSINT_TTL = {
     'lookup_ip_vt':    3600,
     'lookup_ip_abuse': 3600,
     'lookup_threats':  7200,
-    'check_scanner':   1800,
     'whois_domain':    86400,
     'lookup_ports':    3600,
 }
@@ -305,8 +290,6 @@ def call_osint_tool(tool_name: str, args: dict, redis) -> dict:
             result = _abuseipdb(target)
         elif tool_name == 'lookup_threats':
             result = _alienvault(target)
-        elif tool_name == 'check_scanner':
-            result = _greynoise(target)
         elif tool_name == 'whois_domain':
             result = _whois(target)
         elif tool_name == 'lookup_ports':
@@ -472,28 +455,24 @@ def _whois(domain: str) -> dict:
     }
 
 def _shodan(ip: str) -> dict:
-    api_key = get_secret('shodan_api_key')
+    # InternetDB — free, no API key required
     response = requests.get(
-        f'https://api.shodan.io/shodan/host/{ip}',
-        params={'key': api_key},
+        f'https://internetdb.shodan.io/{ip}',
         timeout=10
     )
     response.raise_for_status()
     data = response.json()
 
-    ports = data.get('ports', [])
-    tags  = data.get('tags', [])
-    org   = data.get('org', 'unknown')
-
     return {
-        'tool':    'Shodan',
+        'tool':    'Shodan InternetDB',
         'ip':      ip,
-        'ports':   ports,
-        'tags':    tags,
-        'org':     org,
+        'ports':   data.get('ports', []),
+        'tags':    data.get('tags', []),
+        'cves':    data.get('vulns', []),
         'summary': (
-            f"Shodan: {ip} ({org}) exposes ports {ports[:10]}. "
-            f"Tags: {', '.join(tags)}."
+            f"Shodan: {ip} exposes ports {data.get('ports', [])}. "
+            f"Tags: {', '.join(data.get('tags', []))}. "
+            f"Known CVEs: {', '.join(data.get('vulns', [])[:3])}."
         )
     }
 ```
@@ -509,6 +488,7 @@ import json
 import time
 from datetime import datetime
 import anthropic
+from fastembed import TextEmbedding  # ONNX-based, no torch dependency
 
 from src.agent.agent_prompts import SYSTEM_PROMPT, FLOW_ANALYSIS_PROMPT, LIMIT_HIT_PROMPT
 from src.agent.agent_tools import TOOLS
@@ -523,7 +503,7 @@ MAX_CONCURRENT   = 3
 
 INTERNAL_TOOLS   = {'rag_search', 'generate_rule', 'escalate'}
 OSINT_TOOLS      = {'lookup_ip_vt', 'lookup_ip_abuse', 'lookup_threats',
-                    'check_scanner', 'whois_domain', 'lookup_ports'}
+                 'whois_domain', 'lookup_ports'}
 
 class AgentBudget:
     def __init__(self):
@@ -905,3 +885,6 @@ class InvestigationIncomplete(SOCError):
             technical_detail=f"Agent limit hit: {reason}"
         )
 ```
+GreyNoise: excluded — API requires paid subscription.
+Coverage handled by VirusTotal + AbuseIPDB.
+Can be added post-submission.

@@ -90,22 +90,37 @@ N_FEATURES    = 33
 N_CLASSES     = 3
 
 LABEL_MAP = {
-    'Benign':           0,
-    'Infilteration':    1,
-    'FTP-BruteForce':   2,
-    'SSH-Bruteforce':   2,
-    'BruteForce-Web':   2,
-    'BruteForce-XSS':   2,
-    'SQL-Injection':     2,
-    'DoS-Slowloris':    2,
-    'DoS-Slowhttptest': 2,
-    'DoS-Hulk':         2,
-    'DoS-GoldenEye':    2,
-    'DDoS-HOIC':        2,
-    'DDoS-LOIC-UDP':    2,
-    'DDoS-LOIC-HTTP':   2,
-    'Bot':              2,
-    'Heartbleed':       2,
+    'Benign':                   0,
+    'Infilteration':            1,   # suspicious — only source is 02-28 and 03-01
+    # Brute force (spec names + actual dataset names)
+    'FTP-BruteForce':           2,
+    'SSH-Bruteforce':           2,
+    'Brute Force -Web':         2,
+    'BruteForce-Web':           2,
+    'Brute Force -XSS':         2,
+    'BruteForce-XSS':           2,
+    # Injection
+    'SQL Injection':            2,
+    'SQL-Injection':            2,
+    # DoS
+    'DoS attacks-GoldenEye':    2,
+    'DoS-GoldenEye':            2,
+    'DoS attacks-SlowHTTPTest': 2,
+    'DoS-Slowhttptest':         2,
+    'DoS attacks-Hulk':         2,
+    'DoS-Hulk':                 2,
+    'DoS attacks-Slowloris':    2,
+    'DoS-Slowloris':            2,
+    # DDoS
+    'DDoS attacks-LOIC-HTTP':   2,
+    'DDoS-LOIC-HTTP':           2,
+    'DDOS attack-LOIC-UDP':     2,
+    'DDoS-LOIC-UDP':            2,
+    'DDOS attack-HOIC':         2,
+    'DDoS-HOIC':                2,
+    # Other
+    'Bot':                      2,
+    'Heartbleed':               2,
 }
 
 CLASS_NAMES = {0: 'benign', 1: 'suspicious', 2: 'attack'}
@@ -133,36 +148,44 @@ from src.ml.ml_feature_contract import (
     CLEANING_RULES, RATE_COLUMNS
 )
 
-# Load all training days
-TRAIN_FILES = [
-    'data/02-14-2018.csv',
-    'data/02-15-2018.csv',
-    'data/02-16-2018.csv',
-    'data/02-22-2018.csv',
-    'data/02-23-2018.csv',
+# All 10 files loaded together.
+# Infilteration (suspicious) only exists in 02-28 and 03-01 — a file-level
+# temporal split would put it entirely in training with 0 suspicious in test.
+# Stratified split is used instead (see Decision 2).
+ALL_FILES = [
+    'data/02-14-2018.csv',   # FTP-BruteForce
+    'data/02-15-2018.csv',   # DoS-GoldenEye
+    'data/02-16-2018.csv',   # DoS-SlowHTTPTest
+    'data/02-20-2018.csv',   # DDoS-LOIC-HTTP
+    'data/02-21-2018.csv',   # DDoS-LOIC-UDP, DDoS-HOIC
+    'data/02-22-2018.csv',   # Brute Force, SQL Injection
+    'data/02-23-2018.csv',   # Brute Force, SQL Injection
+    'data/02-28-2018.csv',   # Infilteration (suspicious)
+    'data/03-01-2018.csv',   # Infilteration (suspicious)
+    'data/03-02-2018.csv',   # Bot
 ]
 
-TEST_FILES = [
-    'data/02-28-2018.csv',
-    'data/03-01-2018.csv',
-]
-
-def load_and_clean(file_paths: list) -> pd.DataFrame:
+def load_and_clean(file_paths: list, max_rows_per_file: int = 150_000) -> pd.DataFrame:
+    ESTIMATED_FILE_SIZE = 1_048_576
     dfs = []
     for path in file_paths:
-        df = pd.read_csv(path, low_memory=False)
+        step   = max(1, ESTIMATED_FILE_SIZE // max_rows_per_file)
+        skipfn = lambda i, s=step: i > 0 and i % s != 0
+        df = pd.read_csv(path, skiprows=skipfn, low_memory=False)
 
-        # Drop negative duration
+        # Coerce all columns except Label to numeric.
+        # Some files have a repeated header row mid-file that corrupts dtype inference.
+        for col in df.columns:
+            if col != 'Label':
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
         df = df[df['Flow Duration'] >= 0]
 
-        # Replace inf in rate columns
         for col in RATE_COLUMNS:
             if col in df.columns:
                 df[col] = df[col].replace([np.inf, -np.inf], 0)
 
-        # Fill remaining nulls
         df = df.fillna(0)
-
         dfs.append(df)
 
     return pd.concat(dfs, ignore_index=True)
@@ -180,24 +203,31 @@ def compute_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def map_labels(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df['label'] = df['Label'].map(LABEL_MAP)
-    assert df['label'].isnull().sum() == 0, "Unmapped labels found"
+    df = df[df['label'].notna()]
     return df
 
-# Load data
-train_df = load_and_clean(TRAIN_FILES)
-test_df  = load_and_clean(TEST_FILES)
+# Load, engineer, map
+combined_df = load_and_clean(ALL_FILES)
+combined_df = compute_derived_features(combined_df)
+combined_df = map_labels(combined_df)
 
-train_df = compute_derived_features(train_df)
-test_df  = compute_derived_features(test_df)
+# Balance classes: take all suspicious rows (rarest), sample equal amounts
+# of benign and attack so the model gets equal signal for all three classes.
+n_suspicious = int((combined_df['label'] == 1).sum())
+balanced_df  = pd.concat([
+    combined_df[combined_df['label'] == cid].sample(n=n_suspicious, random_state=42)
+    for cid in [0, 1, 2]
+], ignore_index=True)
 
-train_df = map_labels(train_df)
-test_df  = map_labels(test_df)
-
-X_train = train_df[FEATURE_COLUMNS]
-y_train = train_df[TARGET_COLUMN]
-X_test  = test_df[FEATURE_COLUMNS]
-y_test  = test_df[TARGET_COLUMN]
+# Stratified 80/20 split — guarantees all 3 classes in both train and test.
+from sklearn.model_selection import train_test_split
+X = balanced_df[FEATURE_COLUMNS]
+y = balanced_df[TARGET_COLUMN]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
 
 print(f"Train: {len(X_train)} rows")
 print(f"Test:  {len(X_test)} rows")
