@@ -1,13 +1,19 @@
+import base64
+import html
+import ipaddress
+import os
 import time
 from datetime import datetime, timezone
 
 import streamlit as st
 
 from src.dashboard.dashboard_db import (
+    get_escalated_alerts,
     get_machine_profiles,
     get_recent_alerts,
     get_stats_last_hour,
     get_traces_for_alerts,
+    record_human_decision,
 )
 from src.infra.infra_vault import load_secrets
 
@@ -36,6 +42,11 @@ def _load_stats() -> dict:
 @st.cache_data(ttl=10)
 def _load_alerts() -> list[dict]:
     return get_recent_alerts(limit=50)
+
+
+@st.cache_data(ttl=10)
+def _load_escalated() -> list[dict]:
+    return get_escalated_alerts(limit=50)
 
 
 @st.cache_data(ttl=10)
@@ -73,29 +84,13 @@ _GUARD_BADGE = {
     'modified': (_ORANGE, 'MOD'),
 }
 
-_LOGO_SVG = """<svg width="44" height="44" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="nlg" x1="0" y1="0" x2="44" y2="44" gradientUnits="userSpaceOnUse">
-      <stop offset="0%"   stop-color="#00C2FF"/>
-      <stop offset="50%"  stop-color="#2563EB"/>
-      <stop offset="100%" stop-color="#7C3AED"/>
-    </linearGradient>
-  </defs>
-  <path d="M22 2L40 10V21C40 32 31 41 22 44C13 41 4 32 4 21V10Z" fill="url(#nlg)" opacity="0.92"/>
-  <circle cx="22" cy="20" r="3.2" fill="white"/>
-  <circle cx="14" cy="15" r="1.8" fill="white" opacity="0.85"/>
-  <circle cx="30" cy="15" r="1.8" fill="white" opacity="0.85"/>
-  <circle cx="16" cy="27" r="1.8" fill="white" opacity="0.85"/>
-  <circle cx="28" cy="27" r="1.8" fill="white" opacity="0.85"/>
-  <line x1="22" y1="20" x2="14" y2="15" stroke="white" stroke-width="1.2" opacity="0.65"/>
-  <line x1="22" y1="20" x2="30" y2="15" stroke="white" stroke-width="1.2" opacity="0.65"/>
-  <line x1="22" y1="20" x2="16" y2="27" stroke="white" stroke-width="1.2" opacity="0.65"/>
-  <line x1="22" y1="20" x2="28" y2="27" stroke="white" stroke-width="1.2" opacity="0.65"/>
-  <line x1="14" y1="15" x2="30" y2="15" stroke="white" stroke-width="0.6" opacity="0.3"/>
-  <line x1="14" y1="15" x2="16" y2="27" stroke="white" stroke-width="0.6" opacity="0.3"/>
-  <line x1="30" y1="15" x2="28" y2="27" stroke="white" stroke-width="0.6" opacity="0.3"/>
-  <line x1="16" y1="27" x2="28" y2="27" stroke="white" stroke-width="0.6" opacity="0.3"/>
-</svg>"""
+def _load_logo_b64() -> str:
+    path = os.path.join(os.path.dirname(__file__), 'logo.jpeg')
+    with open(path, 'rb') as f:
+        return base64.b64encode(f.read()).decode()
+
+_LOGO_B64 = _load_logo_b64()
+_LOGO_SVG = f'<img src="data:image/jpeg;base64,{_LOGO_B64}" style="height:44px;width:auto;border-radius:6px">'
 
 
 def _css() -> None:
@@ -117,6 +112,22 @@ def _css() -> None:
     }}
     [data-testid="stSidebar"] * {{ color:{_TEXT} !important; }}
     [data-testid="stSidebarNav"] {{ display:none; }}
+
+    /* ── Sidebar nav buttons ─────────────────────────────── */
+    [data-testid="stSidebar"] [data-testid="stButton"] button {{
+        background:{_CARD2} !important; color:{_TEXT} !important;
+        border:1px solid {_BORDER} !important; border-radius:6px !important;
+        font-size:13px !important; font-weight:500 !important;
+        text-align:left !important; justify-content:flex-start !important;
+        padding:8px 12px !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stButton"] button:hover {{
+        border-color:{_BLUE} !important; color:#fff !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"] {{
+        background:{_BLUE}22 !important; border-color:{_BLUE} !important;
+        color:#fff !important;
+    }}
 
     /* ── Expander (alert cards) ───────────────────────── */
     details {{
@@ -166,8 +177,8 @@ def _css() -> None:
     </style>""", unsafe_allow_html=True)
 
 
-def _sidebar(stats: dict, alerts: list[dict]) -> str | None:
-    """Render sidebar and return selected risk filter."""
+def _sidebar(stats: dict, alerts: list[dict], escalated_count: int) -> tuple[str, str | None]:
+    """Render sidebar. Returns (page, risk_filter)."""
     with st.sidebar:
         st.markdown(f"""
         <div style="padding:20px 0 24px;text-align:center">
@@ -197,35 +208,71 @@ def _sidebar(stats: dict, alerts: list[dict]) -> str | None:
         </div>
         """, unsafe_allow_html=True)
 
-        # Risk breakdown
-        risk_counts = {}
-        for a in alerts:
-            lvl = a.get('risk_level', 'UNKNOWN')
-            risk_counts[lvl] = risk_counts.get(lvl, 0) + 1
+        # Navigation
+        st.markdown(f'<div style="font-size:10px;color:{_MUTED};letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">Navigation</div>', unsafe_allow_html=True)
 
-        st.markdown(f'<div style="font-size:10px;color:{_MUTED};letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">Risk Breakdown</div>', unsafe_allow_html=True)
-        for lvl in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
-            count = risk_counts.get(lvl, 0)
-            color = _RISK_COLOR.get(lvl, _GRAY)
-            pct   = int((count / len(alerts) * 100)) if alerts else 0
-            st.markdown(f"""
-            <div style="margin-bottom:8px">
-                <div style="display:flex;justify-content:space-between;margin-bottom:3px">
-                    <span style="font-size:11px;color:{color};font-weight:600">{lvl}</span>
-                    <span style="font-size:11px;color:{_MUTED};font-family:monospace">{count}</span>
-                </div>
-                <div style="background:{_BORDER};height:3px;border-radius:2px">
-                    <div style="background:{color};width:{pct}%;height:3px;border-radius:2px"></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+        review_label = f'👤 Human Review Queue'
+        if escalated_count > 0:
+            review_label = f'👤 Human Review Queue  🔴 {escalated_count}'
+
+        if 'page' not in st.session_state:
+            st.session_state['page'] = 'overview'
+
+        if st.button('⚡  Overview', use_container_width=True,
+                     type='primary' if st.session_state['page'] == 'overview' else 'secondary'):
+            st.session_state['page'] = 'overview'
+        if st.button(review_label, use_container_width=True,
+                     type='primary' if st.session_state['page'] == 'review' else 'secondary'):
+            st.session_state['page'] = 'review'
+
+        page = st.session_state['page']
 
         st.markdown(f'<div style="border-top:1px solid {_BORDER};margin:20px 0"></div>', unsafe_allow_html=True)
 
-        # Filter
-        st.markdown(f'<div style="font-size:10px;color:{_MUTED};letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">Filter by Risk</div>', unsafe_allow_html=True)
-        choice = st.selectbox('Risk filter', ['All', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'], label_visibility='collapsed')
-        return None if choice == 'All' else choice
+        risk_filter = None
+        if page == 'overview':
+            # Risk breakdown
+            risk_counts = {}
+            for a in alerts:
+                lvl = a.get('risk_level', 'UNKNOWN')
+                risk_counts[lvl] = risk_counts.get(lvl, 0) + 1
+
+            st.markdown(f"""
+            <div style="font-size:10px;color:{_MUTED};letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">
+                Risk Breakdown
+                <span style="font-size:9px;color:{_MUTED};letter-spacing:0;text-transform:none;
+                    font-weight:400;margin-left:6px;opacity:0.7">(top 50 recent)</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            _RISK_DESC = {
+                'CRITICAL': 'risk score ≥ 0.80 · act immediately',
+                'HIGH':     'risk score ≥ 0.50 · investigate now',
+            }
+            for lvl in ['CRITICAL', 'HIGH']:
+                count = risk_counts.get(lvl, 0)
+                color = _RISK_COLOR.get(lvl, _GRAY)
+                pct   = int((count / len(alerts) * 100)) if alerts else 0
+                desc  = _RISK_DESC[lvl]
+                st.markdown(f"""
+                <div style="margin-bottom:10px">
+                    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px">
+                        <span style="font-size:11px;color:{color};font-weight:600">{lvl}</span>
+                        <span style="font-size:11px;color:{_MUTED};font-family:monospace">{count}</span>
+                    </div>
+                    <div style="font-size:9px;color:{_MUTED};opacity:0.7;margin-bottom:4px">{desc}</div>
+                    <div style="background:{_BORDER};height:3px;border-radius:2px">
+                        <div style="background:{color};width:{pct}%;height:3px;border-radius:2px"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown(f'<div style="border-top:1px solid {_BORDER};margin:20px 0"></div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="font-size:10px;color:{_MUTED};letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">Filter by Risk</div>', unsafe_allow_html=True)
+            choice = st.selectbox('Risk filter', ['All', 'CRITICAL', 'HIGH'], label_visibility='collapsed')
+            risk_filter = None if choice == 'All' else choice
+
+        return page, risk_filter
 
 
 def _kpi_row(stats: dict) -> None:
@@ -289,7 +336,7 @@ def _trace_step(step: dict, is_last: bool) -> str:
     dur = step.get('duration_ms')
     dur_html = f'<span style="color:{_MUTED};font-size:11px;margin-left:8px;font-family:monospace">{dur}ms</span>' if dur is not None else ''
 
-    summary = (step.get('result_summary') or '').strip()
+    summary = html.escape((step.get('result_summary') or '').strip())
     summary_html = (
         f'<div style="color:{_MUTED};font-size:12px;margin-top:5px;line-height:1.5;'
         f'max-height:72px;overflow:hidden;font-family:monospace">{summary[:300]}</div>'
@@ -373,7 +420,6 @@ def _render_alerts(alerts: list[dict], traces: dict, risk_filter: str | None) ->
         )
 
         with st.expander(f'[{level}]  {machine}  ·  {ts}', expanded=False):
-            # Inject colored left border via sibling hack (best we can do in Streamlit)
             st.markdown(f"""
             <div style="border-left:3px solid {color};padding-left:14px;margin-bottom:16px">
                 <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
@@ -382,6 +428,7 @@ def _render_alerts(alerts: list[dict], traces: dict, risk_filter: str | None) ->
                     <span style="font-family:monospace;font-size:11px;color:{_MUTED}">{ts}</span>
                     {fw_tag}{esc_tag}
                 </div>
+            </div>
             """, unsafe_allow_html=True)
 
             # Score row
@@ -415,7 +462,7 @@ def _render_alerts(alerts: list[dict], traces: dict, risk_filter: str | None) ->
             col_l, col_r = st.columns([3, 2])
             with col_l:
                 st.markdown(f'<div style="font-size:10px;color:{_MUTED};letter-spacing:2px;margin-bottom:6px">SUMMARY</div>', unsafe_allow_html=True)
-                summary = alert.get('summary') or '—'
+                summary = html.escape(alert.get('summary') or '—')
                 st.markdown(f'<div style="color:{_TEXT};font-size:13px;line-height:1.6">{summary}</div>', unsafe_allow_html=True)
 
                 action = alert.get('recommended_action') or '—'
@@ -440,11 +487,178 @@ def _render_alerts(alerts: list[dict], traces: dict, risk_filter: str | None) ->
                 if alert.get('limit_hit'):
                     st.markdown(f'<div style="color:{_ORANGE};font-size:12px;margin-top:8px">⚠ LLM budget reached — investigation may be partial</div>', unsafe_allow_html=True)
 
-            st.markdown('</div>', unsafe_allow_html=True)
             st.markdown(f'<div style="border-top:1px solid {_BORDER};margin:14px 0 12px"></div>', unsafe_allow_html=True)
 
             alert_id = str(alert.get('id', ''))
             _render_trace(traces.get(alert_id, []))
+
+
+def _escalation_reason(alert: dict) -> str:
+    """Infer why this alert was escalated to human review."""
+    machine_ip = alert.get('machine_ip', '')
+    tools      = alert.get('tools_called') or []
+    summary    = alert.get('summary') or ''
+    confidence = alert.get('machine_confidence')
+
+    try:
+        if ipaddress.ip_address(machine_ip).is_private:
+            return 'Internal IP — no external threat intelligence available'
+    except ValueError:
+        pass
+
+    if 'escalate' in tools:
+        return 'AI agent requested human verification'
+
+    if summary.startswith('Agent error') or 'flagged for manual review' in summary:
+        return 'Investigation failed — manual review required'
+
+    if confidence is not None and confidence < 0.30:
+        return 'Low model confidence — insufficient behavioral data'
+
+    return 'High risk score requiring analyst verification'
+
+
+def _render_review_queue(escalated: list[dict], traces: dict) -> None:
+    count = len(escalated)
+    color_hdr = _RED if count > 0 else _GREEN
+
+    st.markdown(f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+        <div>
+            <div style="font-size:20px;font-weight:800;color:#fff">👤 Human Review Queue</div>
+            <div style="font-size:12px;color:{_MUTED};margin-top:4px">
+                Alerts the AI flagged as needing analyst verification before action is taken
+            </div>
+        </div>
+        <div style="background:{color_hdr}18;border:1px solid {color_hdr}44;border-radius:10px;
+            padding:10px 20px;text-align:center">
+            <div style="font-size:32px;font-weight:900;color:{color_hdr};font-family:monospace">{count}</div>
+            <div style="font-size:9px;color:{_MUTED};letter-spacing:2px">AWAITING REVIEW</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not escalated:
+        st.markdown(f"""
+        <div style="background:{_CARD};border:1px solid {_BORDER};border-radius:12px;
+            padding:40px;text-align:center;color:{_MUTED}">
+            ✅ No alerts awaiting review
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    for alert in escalated:
+        alert_id = str(alert.get('id', ''))
+        level    = alert.get('risk_level', 'UNKNOWN')
+        color    = _RISK_COLOR.get(level, _GRAY)
+        machine  = str(alert.get('machine_ip', '—'))
+        ts       = str(alert.get('created_at', ''))[:19].replace('T', ' ')
+        reason   = _escalation_reason(alert)
+        fw       = alert.get('firewall_rule') or ''
+        cs       = alert.get('classifier_score')
+        ds       = alert.get('deviation_score')
+
+        with st.expander(f'[{level}]  {machine}  ·  {ts}', expanded=True):
+            # Why escalated banner
+            st.markdown(f"""
+            <div style="background:{_ORANGE}12;border:1px solid {_ORANGE}44;border-radius:8px;
+                padding:10px 14px;margin-bottom:16px;display:flex;align-items:center;gap:10px">
+                <span style="font-size:16px">⚠️</span>
+                <div>
+                    <div style="font-size:10px;color:{_ORANGE};letter-spacing:2px;
+                        font-weight:700;margin-bottom:2px">ESCALATION REASON</div>
+                    <div style="font-size:13px;color:{_TEXT}">{reason}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            col_l, col_r = st.columns([3, 2])
+
+            with col_l:
+                # Scores
+                st.markdown(f"""
+                <div style="display:flex;gap:12px;margin-bottom:14px">
+                    <div style="background:#080A12;border:1px solid {_BORDER};border-radius:8px;
+                        padding:10px 14px;flex:1;text-align:center">
+                        <div style="font-size:9px;color:{_MUTED};letter-spacing:2px;margin-bottom:4px">CLASSIFIER</div>
+                        <div style="font-size:24px;font-weight:800;color:{_CYAN};font-family:monospace">
+                            {f'{cs:.2f}' if cs is not None else '—'}
+                        </div>
+                    </div>
+                    <div style="background:#080A12;border:1px solid {_BORDER};border-radius:8px;
+                        padding:10px 14px;flex:1;text-align:center">
+                        <div style="font-size:9px;color:{_MUTED};letter-spacing:2px;margin-bottom:4px">DEVIATION</div>
+                        <div style="font-size:24px;font-weight:800;color:{_PURPLE};font-family:monospace">
+                            {f'{ds:.2f}' if ds is not None else '—'}
+                        </div>
+                    </div>
+                    <div style="background:#080A12;border:1px solid {color};border-radius:8px;
+                        padding:10px 14px;flex:1;text-align:center">
+                        <div style="font-size:9px;color:{_MUTED};letter-spacing:2px;margin-bottom:4px">RISK</div>
+                        <div style="font-size:24px;font-weight:800;font-family:monospace;color:{color}">{level}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Summary
+                summary = html.escape(alert.get('summary') or '—')
+                st.markdown(f"""
+                <div style="font-size:10px;color:{_MUTED};letter-spacing:2px;margin-bottom:6px">AI SUMMARY</div>
+                <div style="color:{_TEXT};font-size:13px;line-height:1.6;margin-bottom:14px">{summary}</div>
+                """, unsafe_allow_html=True)
+
+                # Trace
+                _render_trace(traces.get(alert_id, []))
+
+            with col_r:
+                st.markdown(f'<div style="font-size:10px;color:{_MUTED};letter-spacing:2px;margin-bottom:10px">YOUR DECISION</div>', unsafe_allow_html=True)
+
+                with st.form(key=f'decision_{alert_id}'):
+                    decision = st.radio(
+                        'Action',
+                        ['Block IP', 'Allow (mark as benign)', 'Custom rule', 'Investigate further'],
+                        label_visibility='collapsed',
+                    )
+
+                    custom_rule = None
+                    if decision == 'Custom rule':
+                        custom_rule = st.text_input(
+                            'Firewall rule',
+                            value=fw,
+                            placeholder='iptables -A INPUT -s x.x.x.x -j DROP',
+                        )
+                    elif decision == 'Block IP' and fw:
+                        st.code(fw, language='bash')
+
+                    note = st.text_area(
+                        'Note (optional)',
+                        placeholder='Reason for your decision...',
+                        height=80,
+                    )
+
+                    submitted = st.form_submit_button('Submit Decision', type='primary', use_container_width=True)
+
+                    if submitted:
+                        decision_map = {
+                            'Block IP':                'block',
+                            'Allow (mark as benign)':  'allow',
+                            'Custom rule':             'custom',
+                            'Investigate further':     'pending',
+                        }
+                        rule_to_store = custom_rule if decision == 'Custom rule' else (fw if decision == 'Block IP' else None)
+
+                        try:
+                            record_human_decision(
+                                alert_id  = alert_id,
+                                decision  = decision_map[decision],
+                                custom_rule = rule_to_store,
+                                note      = note or None,
+                            )
+                            st.success('Decision recorded. Alert moved out of queue.')
+                            _load_escalated.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f'Failed to save decision: {e}')
 
 
 def _render_profiles(profiles: list[dict]) -> None:
@@ -481,8 +695,10 @@ def main() -> None:
     try:
         stats     = _load_stats()
         alerts    = _load_alerts()
+        escalated = _load_escalated()
         alert_ids = tuple(str(a['id']) for a in alerts if a.get('id'))
-        traces    = _load_traces(alert_ids)
+        esc_ids   = tuple(str(a['id']) for a in escalated if a.get('id'))
+        traces    = _load_traces(alert_ids + esc_ids)
         profiles  = _load_profiles()
     except Exception as exc:
         st.error(f'Database error: {exc}')
@@ -490,7 +706,7 @@ def main() -> None:
         st.rerun()
         return
 
-    risk_filter = _sidebar(stats, alerts)
+    page, risk_filter = _sidebar(stats, alerts, len(escalated))
 
     # ── Header bar ──────────────────────────────────────────────────────────────
     st.markdown(f"""
@@ -527,15 +743,18 @@ def main() -> None:
     </style>
     """, unsafe_allow_html=True)
 
-    # ── KPI strip ───────────────────────────────────────────────────────────────
-    _kpi_row(stats)
-    st.markdown('<div style="margin:24px 0"></div>', unsafe_allow_html=True)
+    if page == 'review':
+        _render_review_queue(escalated, traces)
+    else:
+        # ── KPI strip ───────────────────────────────────────────────────────────
+        _kpi_row(stats)
+        st.markdown('<div style="margin:24px 0"></div>', unsafe_allow_html=True)
 
-    # ── Main content ────────────────────────────────────────────────────────────
-    _render_alerts(alerts, traces, risk_filter)
+        # ── Main content ────────────────────────────────────────────────────────
+        _render_alerts(alerts, traces, risk_filter)
 
-    st.markdown(f'<hr style="margin:28px 0">', unsafe_allow_html=True)
-    _render_profiles(profiles)
+        st.markdown(f'<hr style="margin:28px 0">', unsafe_allow_html=True)
+        _render_profiles(profiles)
 
     time.sleep(_REFRESH)
     st.rerun()

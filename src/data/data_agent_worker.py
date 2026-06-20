@@ -1,4 +1,5 @@
 import json
+import os
 
 import structlog
 
@@ -16,7 +17,7 @@ from src.infra.infra_vault import load_secrets
 logger = structlog.get_logger(__name__)
 
 _GROUP    = 'agent-group'
-_CONSUMER = 'agent-1'
+_CONSUMER = os.environ.get('HOSTNAME', 'agent-1')
 
 _SCORING_KEYS = {'ml_label', 'ml_confidence', 'classifier_score', 'risk_score', 'risk_level'}
 

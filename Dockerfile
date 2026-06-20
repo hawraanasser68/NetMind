@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
 # Pre-download the ONNX embedding model at build time (~23MB, no GPU packages)
-RUN python -c "from fastembed import TextEmbedding; list(TextEmbedding('sentence-transformers/all-MiniLM-L6-v2').embed(['warmup']))"
+RUN mkdir -p /tmp && TMPDIR=/tmp python -c "from fastembed import TextEmbedding; list(TextEmbedding('sentence-transformers/all-MiniLM-L6-v2').embed(['warmup']))"
 
 # Copy source code
 COPY src/ ./src/

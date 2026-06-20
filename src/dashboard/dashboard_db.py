@@ -118,6 +118,45 @@ def get_traces_for_alerts(alert_ids: list[str]) -> dict[str, list[dict]]:
     return result
 
 
+def get_escalated_alerts(limit: int = 50) -> list[dict]:
+    """Fetch open alerts that need human review."""
+    with _get_conn().cursor() as cur:
+        cur.execute("""
+            SELECT
+                id, machine_ip, flow_id, created_at, risk_level, status,
+                summary, recommended_action, iocs, osint_results,
+                classifier_score, deviation_score, machine_confidence,
+                tools_called, firewall_rule, limit_hit, escalated_to_human,
+                human_decision, human_note, reviewed_at
+            FROM security_alerts
+            WHERE escalated_to_human = TRUE AND status = 'open'
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_human_decision(
+    alert_id: str,
+    decision: str,
+    custom_rule: str | None = None,
+    note: str | None = None,
+) -> None:
+    """Record a human analyst's decision on an escalated alert."""
+    with _get_conn().cursor() as cur:
+        cur.execute("""
+            UPDATE security_alerts
+            SET
+                status          = 'resolved',
+                human_decision  = %s,
+                human_note      = %s,
+                firewall_rule   = COALESCE(%s, firewall_rule),
+                reviewed_at     = NOW()
+            WHERE id = %s::uuid
+        """, (decision, note, custom_rule, alert_id))
+
+
 def get_machine_profiles() -> list[dict]:
     with _get_conn().cursor() as cur:
         cur.execute("""
